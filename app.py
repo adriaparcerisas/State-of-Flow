@@ -367,31 +367,34 @@ ORDER BY period DESC;
 # ---------- SQL: Active Accounts ----------
 SQL_ACTIVE_ACCOUNTS_TOTAL = """
 WITH time_periods AS (
-    SELECT CASE '{{Period}}'
-        WHEN 'all_time' THEN '2020-01-01'::DATE
-        WHEN 'last_year' THEN CURRENT_DATE - INTERVAL '1 YEAR'
-        WHEN 'last_3_months' THEN CURRENT_DATE - INTERVAL '3 MONTHS'
-        WHEN 'last_month' THEN CURRENT_DATE - INTERVAL '1 MONTH'
-        WHEN 'last_week' THEN CURRENT_DATE - INTERVAL '1 WEEK'
-        ELSE CURRENT_DATE - INTERVAL '1 DAY'
+  SELECT
+    CASE '{{Period}}'
+      WHEN 'all_time'      THEN '2020-01-01'::DATE
+      WHEN 'last_year'     THEN CURRENT_DATE - INTERVAL '1 YEAR'
+      WHEN 'last_3_months' THEN CURRENT_DATE - INTERVAL '3 MONTHS'
+      WHEN 'last_month'    THEN CURRENT_DATE - INTERVAL '1 MONTH'
+      WHEN 'last_week'     THEN CURRENT_DATE - INTERVAL '1 WEEK'
+      ELSE CURRENT_DATE - INTERVAL '1 DAY'
     END AS start_date
 ),
 active_addresses AS (
-    SELECT COUNT(DISTINCT CAST(a.value AS VARCHAR)) AS active_addresses
-    FROM flow.core.ez_transaction_actors b,
-         LATERAL FLATTEN(INPUT => b.actors) a
-    CROSS JOIN time_periods tp
-    WHERE b.block_timestamp >= tp.start_date
+  -- Cadence
+  SELECT COUNT(DISTINCT CAST(a.value AS VARCHAR)) AS active_addresses
+  FROM flow.core.ez_transaction_actors b,
+       LATERAL FLATTEN(INPUT => b.actors) a
+  CROSS JOIN time_periods tp
+  WHERE b.block_timestamp >= tp.start_date
 
-    UNION ALL
+  UNION ALL
 
-    SELECT COUNT(DISTINCT from_address) AS active_addresses
-    FROM flow.core_evm.fact_transactions ft
-    CROSS JOIN time_periods tp
-    WHERE ft.block_timestamp >= tp.start_date
+  -- EVM
+  SELECT COUNT(DISTINCT ft.from_address) AS active_addresses
+  FROM flow.core_evm.fact_transactions ft
+  CROSS JOIN time_periods tp
+  WHERE ft.block_timestamp >= tp.start_date
 )
 SELECT SUM(active_addresses) AS total_active_addresses
-FROM active_addresses
+FROM active_addresses;
 """
 
 SQL_ACTIVE_ACCOUNTS_EVM = """
@@ -480,16 +483,26 @@ aggregated_data AS (
     GROUP BY 1,2
 ),
 final_data AS (
-    SELECT
-        day, type, active_users,
-        CASE WHEN type = 'EVM + Cadence'
-             THEN AVG(active_users) OVER (PARTITION BY type ORDER BY day ROWS BETWEEN 3 PRECEDING AND CURRENT ROW)
-        END AS rolling_avg
-    FROM aggregated_data
+  SELECT
+    day,
+    type,
+    active_users,
+    CASE
+      WHEN type = 'EVM + Cadence' THEN AVG(active_users) OVER (
+        PARTITION BY type
+        ORDER BY day
+        ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
+      )
+      ELSE NULL
+    END AS rolling_avg
+  FROM aggregated_data
 )
-SELECT day, type, active_users, rolling_avg
+SELECT 
+  day,
+  type,
+  active_users,
+  rolling_avg
 FROM final_data
-WHERE day < TRUNC(current_date,'week')
 ORDER BY day DESC, type
 """
 
