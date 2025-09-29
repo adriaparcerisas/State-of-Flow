@@ -495,18 +495,17 @@ ORDER BY day DESC, type
 
 SQL_ACTIVE_ACCOUNTS_WEEK_TABLE = """
 WITH weekly_periods AS (
-    SELECT 
-        CASE WHEN num=0 THEN DATE_TRUNC('week', CURRENT_DATE)
-             ELSE dateadd('week', -num, current_date) END AS start_date,
-        CASE WHEN num=0 THEN CURRENT_TIMESTAMP
-             ELSE dateadd('week', -num+1, current_date) END AS end_date,
-        num AS weeks_ago,
-        TO_CHAR(CASE WHEN num=0 THEN DATE_TRUNC('week', CURRENT_DATE)
-                     ELSE dateadd('week', -num, current_date) END,'YYYY-MM-DD') || ' to ' ||
-        TO_CHAR(CASE WHEN num=0 THEN CURRENT_DATE
-                     ELSE dateadd('week', -num+1, current_date) END,'YYYY-MM-DD') AS date_range
-    FROM (SELECT row_number() over (order by seq4()) - 1 AS num
-          FROM table(generator(rowcount => 12)))
+    SELECT
+  DATEADD('week', -num-1, DATE_TRUNC('week', CURRENT_DATE)) AS start_date,
+  DATEADD('week', -num,   DATE_TRUNC('week', CURRENT_DATE)) AS end_date,
+  num AS weeks_ago,
+  TO_CHAR(DATEADD('week', -num-1, DATE_TRUNC('week', CURRENT_DATE)), 'YYYY-MM-DD')
+    || ' to ' ||
+  TO_CHAR(DATEADD('day', -1, DATEADD('week', -num, DATE_TRUNC('week', CURRENT_DATE))), 'YYYY-MM-DD')
+    AS date_range
+FROM (
+  SELECT ROW_NUMBER() OVER (ORDER BY SEQ4()) - 1 AS num
+  FROM TABLE(GENERATOR(ROWCOUNT => 12))
 ),
 cadence_accounts AS (
     SELECT wp.weeks_ago, wp.date_range,
@@ -549,7 +548,6 @@ combined_metrics AS (
     FROM weekly_periods wp
     LEFT JOIN cadence_accounts c ON wp.weeks_ago = c.weeks_ago
     LEFT JOIN evm_accounts e     ON wp.weeks_ago = e.weeks_ago
-    where wp.weeks_ago <trunc(current_date,'week')
 )
 SELECT 
     '# transacting wallets on Cadence' AS "New Addresses Created",
