@@ -376,10 +376,10 @@ WITH time_periods AS (
         ELSE CURRENT_DATE - INTERVAL '1 DAY'
     END AS start_date, CURRENT_DATE AS end_date
 )
-SELECT COUNT(DISTINCT from_address) AS total_active_addresses
-FROM flow.core.ez_transaction_actors ft
-       LATERAL FLATTEN(INPUT => b.actors) a
-CROSS JOIN time_periods tp
+SELECT COUNT(DISTINCT actors[0]) AS total_active_addresses
+FROM time_periods tp
+cross join flow.core.ez_transaction_actors ft,
+    LATERAL FLATTEN(INPUT => ft.actors) a
 WHERE ft.block_timestamp >= tp.start_date
   AND ft.block_timestamp <  tp.end_date
 """
