@@ -494,150 +494,190 @@ ORDER BY day DESC, type
 """
 
 SQL_ACTIVE_ACCOUNTS_WEEK_TABLE = """
-WITH weekly_periods AS (
-    SELECT
-  DATEADD('week', -num-1, DATE_TRUNC('week', CURRENT_DATE)) AS start_date,
-  DATEADD('week', -num,   DATE_TRUNC('week', CURRENT_DATE)) AS end_date,
-  num AS weeks_ago,
-  TO_CHAR(DATEADD('week', -num-1, DATE_TRUNC('week', CURRENT_DATE)), 'YYYY-MM-DD')
-    || ' to ' ||
-  TO_CHAR(DATEADD('day', -1, DATEADD('week', -num, DATE_TRUNC('week', CURRENT_DATE))), 'YYYY-MM-DD')
-    AS date_range
-FROM (
+WITH seq AS (
   SELECT ROW_NUMBER() OVER (ORDER BY SEQ4()) - 1 AS num
   FROM TABLE(GENERATOR(ROWCOUNT => 12))
 ),
+
+-- Monday of *current* week at 00:00, independent of session WEEK_START
+base AS (
+  SELECT DATEADD('day', 1 - DAYOFWEEKISO(CURRENT_DATE), CURRENT_DATE) AS this_monday
+),
+
+weekly_periods AS (
+  -- num=0 => last full week: [prev Monday, this Monday)
+  SELECT
+    DATEADD('week', - (num + 1), b.this_monday) AS start_date,
+    DATEADD('week', -  num      , b.this_monday) AS end_date,
+    num AS weeks_ago,
+    TO_CHAR(DATEADD('week', - (num + 1), b.this_monday), 'YYYY-MM-DD')
+      || ' to '
+      || TO_CHAR(DATEADD('day', -1, DATEADD('week', -num, b.this_monday)), 'YYYY-MM-DD')
+      AS date_range
+  FROM seq s
+  CROSS JOIN base b
+),
+
 cadence_accounts AS (
-    SELECT wp.weeks_ago, wp.date_range,
-           COUNT(DISTINCT first_tx.value) AS new_accounts
-    FROM weekly_periods wp
-    LEFT JOIN (
-        SELECT a.value, MIN(block_timestamp) AS first_tx_time
-        FROM flow.core.ez_transaction_actors,
-             LATERAL FLATTEN(INPUT => actors) a
-        GROUP BY a.value
-    ) first_tx
-      ON first_tx.first_tx_time >= wp.start_date AND first_tx.first_tx_time < wp.end_date
-    GROUP BY wp.weeks_ago, wp.date_range
+  SELECT
+    wp.weeks_ago,
+    wp.date_range,
+    COUNT(DISTINCT CAST(first_tx.value AS VARCHAR)) AS new_accounts
+  FROM weekly_periods wp
+  LEFT JOIN (
+    SELECT a.value, MIN(block_timestamp) AS first_tx_time
+    FROM flow.core.ez_transaction_actors t,
+         LATERAL FLATTEN(INPUT => t.actors) a
+    GROUP BY a.value
+  ) first_tx
+    ON first_tx.first_tx_time >= wp.start_date
+   AND first_tx.first_tx_time <  wp.end_date
+  GROUP BY wp.weeks_ago, wp.date_range
 ),
+
 evm_accounts AS (
-    SELECT wp.weeks_ago, wp.date_range,
-           COUNT(DISTINCT from_address) AS new_accounts
-    FROM weekly_periods wp
-    LEFT JOIN (
-        SELECT from_address, MIN(block_timestamp) AS first_tx_time
-        FROM flow.core_evm.fact_transactions
-        GROUP BY from_address
-    ) t
-      ON t.first_tx_time >= wp.start_date AND t.first_tx_time < wp.end_date
-    GROUP BY wp.weeks_ago, wp.date_range
+  SELECT
+    wp.weeks_ago,
+    wp.date_range,
+    COUNT(DISTINCT t.from_address) AS new_accounts
+  FROM weekly_periods wp
+  LEFT JOIN (
+    SELECT from_address, MIN(block_timestamp) AS first_tx_time
+    FROM flow.core_evm.fact_transactions
+    GROUP BY from_address
+  ) t
+    ON t.first_tx_time >= wp.start_date
+   AND t.first_tx_time <  wp.end_date
+  GROUP BY wp.weeks_ago, wp.date_range
 ),
+
 combined_metrics AS (
-    SELECT 
-        wp.weeks_ago, wp.date_range,
-        c.new_accounts AS cadence_accounts,
-        ROUND(((c.new_accounts - LAG(c.new_accounts) OVER (ORDER BY wp.weeks_ago DESC)) /
-              NULLIF(LAG(c.new_accounts) OVER (ORDER BY wp.weeks_ago DESC),0) * 100),2) AS cadence_pct_change,
-        e.new_accounts AS evm_accounts,
-        ROUND(((e.new_accounts - LAG(e.new_accounts) OVER (ORDER BY wp.weeks_ago DESC)) /
-              NULLIF(LAG(e.new_accounts) OVER (ORDER BY wp.weeks_ago DESC),0) * 100),2) AS evm_pct_change,
-        (c.new_accounts + e.new_accounts) AS total_accounts,
-        ROUND((((c.new_accounts + e.new_accounts) -
-              LAG(c.new_accounts + e.new_accounts) OVER (ORDER BY wp.weeks_ago DESC)) /
-              NULLIF(LAG(c.new_accounts + e.new_accounts) OVER (ORDER BY wp.weeks_ago DESC),0) * 100),2) AS total_pct_change
-    FROM weekly_periods wp
-    LEFT JOIN cadence_accounts c ON wp.weeks_ago = c.weeks_ago
-    LEFT JOIN evm_accounts e     ON wp.weeks_ago = e.weeks_ago
+  SELECT
+    wp.weeks_ago,
+    wp.date_range,
+    c.new_accounts AS cadence_accounts,
+    ROUND(
+      (
+        c.new_accounts
+        - LAG(c.new_accounts) OVER (ORDER BY wp.weeks_ago DESC)
+      )
+      / NULLIF(LAG(c.new_accounts) OVER (ORDER BY wp.weeks_ago DESC), 0) * 100
+    , 2) AS cadence_pct_change,
+    e.new_accounts AS evm_accounts,
+    ROUND(
+      (
+        e.new_accounts
+        - LAG(e.new_accounts) OVER (ORDER BY wp.weeks_ago DESC)
+      )
+      / NULLIF(LAG(e.new_accounts) OVER (ORDER BY wp.weeks_ago DESC), 0) * 100
+    , 2) AS evm_pct_change,
+    (c.new_accounts + e.new_accounts) AS total_accounts,
+    ROUND(
+      (
+        (c.new_accounts + e.new_accounts)
+        - LAG(c.new_accounts + e.new_accounts) OVER (ORDER BY wp.weeks_ago DESC)
+      )
+      / NULLIF(LAG(c.new_accounts + e.new_accounts) OVER (ORDER BY wp.weeks_ago DESC), 0) * 100
+    , 2) AS total_pct_change
+  FROM weekly_periods wp
+  LEFT JOIN cadence_accounts c ON c.weeks_ago = wp.weeks_ago
+  LEFT JOIN evm_accounts e     ON e.weeks_ago = wp.weeks_ago
 )
+
 SELECT 
-    '# transacting wallets on Cadence' AS "New Addresses Created",
-    MAX(CASE WHEN weeks_ago=0 THEN cadence_accounts::STRING END) AS "Current Week",
-    MAX(CASE WHEN weeks_ago=1 THEN cadence_accounts::STRING END) AS "Last Week",
-    MAX(CASE WHEN weeks_ago=2 THEN cadence_accounts::STRING END) AS "2 Weeks Ago",
-    MAX(CASE WHEN weeks_ago=3 THEN cadence_accounts::STRING END) AS "3 Weeks Ago",
-    MAX(CASE WHEN weeks_ago=4 THEN cadence_accounts::STRING END) AS "4 Weeks Ago",
-    MAX(CASE WHEN weeks_ago=5 THEN cadence_accounts::STRING END) AS "5 Weeks Ago",
-    MAX(CASE WHEN weeks_ago=6 THEN cadence_accounts::STRING END) AS "6 Weeks Ago",
-    MAX(CASE WHEN weeks_ago=7 THEN cadence_accounts::STRING END) AS "7 Weeks Ago",
-    MAX(CASE WHEN weeks_ago=8 THEN cadence_accounts::STRING END) AS "8 Weeks Ago",
-    MAX(CASE WHEN weeks_ago=9 THEN cadence_accounts::STRING END) AS "9 Weeks Ago",
-    MAX(CASE WHEN weeks_ago=10 THEN cadence_accounts::STRING END) AS "10 Weeks Ago",
-    MAX(CASE WHEN weeks_ago=11 THEN cadence_accounts::STRING END) AS "11 Weeks Ago"
+  '# transacting wallets on Cadence' AS "New Addresses Created",
+  MAX(CASE WHEN weeks_ago = 0 THEN cadence_accounts::STRING END) AS "Last Full Week",
+  MAX(CASE WHEN weeks_ago = 1 THEN cadence_accounts::STRING END) AS "1 Week Ago",
+  MAX(CASE WHEN weeks_ago = 2 THEN cadence_accounts::STRING END) AS "2 Weeks Ago",
+  MAX(CASE WHEN weeks_ago = 3 THEN cadence_accounts::STRING END) AS "3 Weeks Ago",
+  MAX(CASE WHEN weeks_ago = 4 THEN cadence_accounts::STRING END) AS "4 Weeks Ago",
+  MAX(CASE WHEN weeks_ago = 5 THEN cadence_accounts::STRING END) AS "5 Weeks Ago",
+  MAX(CASE WHEN weeks_ago = 6 THEN cadence_accounts::STRING END) AS "6 Weeks Ago",
+  MAX(CASE WHEN weeks_ago = 7 THEN cadence_accounts::STRING END) AS "7 Weeks Ago",
+  MAX(CASE WHEN weeks_ago = 8 THEN cadence_accounts::STRING END) AS "8 Weeks Ago",
+  MAX(CASE WHEN weeks_ago = 9 THEN cadence_accounts::STRING END) AS "9 Weeks Ago",
+  MAX(CASE WHEN weeks_ago = 10 THEN cadence_accounts::STRING END) AS "10 Weeks Ago",
+  MAX(CASE WHEN weeks_ago = 11 THEN cadence_accounts::STRING END) AS "11 Weeks Ago"
 FROM combined_metrics
+
 UNION ALL
 SELECT 'Cadence % Change',
-    MAX(CASE WHEN weeks_ago=0 THEN cadence_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=1 THEN cadence_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=2 THEN cadence_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=3 THEN cadence_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=4 THEN cadence_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=5 THEN cadence_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=6 THEN cadence_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=7 THEN cadence_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=8 THEN cadence_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=9 THEN cadence_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=10 THEN cadence_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=11 THEN cadence_pct_change::STRING END)
+  MAX(CASE WHEN weeks_ago = 0 THEN cadence_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 1 THEN cadence_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 2 THEN cadence_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 3 THEN cadence_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 4 THEN cadence_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 5 THEN cadence_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 6 THEN cadence_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 7 THEN cadence_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 8 THEN cadence_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 9 THEN cadence_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 10 THEN cadence_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 11 THEN cadence_pct_change::STRING END)
 FROM combined_metrics
+
 UNION ALL
 SELECT '# transacting wallets on EVM',
-    MAX(CASE WHEN weeks_ago=0 THEN evm_accounts::STRING END),
-    MAX(CASE WHEN weeks_ago=1 THEN evm_accounts::STRING END),
-    MAX(CASE WHEN weeks_ago=2 THEN evm_accounts::STRING END),
-    MAX(CASE WHEN weeks_ago=3 THEN evm_accounts::STRING END),
-    MAX(CASE WHEN weeks_ago=4 THEN evm_accounts::STRING END),
-    MAX(CASE WHEN weeks_ago=5 THEN evm_accounts::STRING END),
-    MAX(CASE WHEN weeks_ago=6 THEN evm_accounts::STRING END),
-    MAX(CASE WHEN weeks_ago=7 THEN evm_accounts::STRING END),
-    MAX(CASE WHEN weeks_ago=8 THEN evm_accounts::STRING END),
-    MAX(CASE WHEN weeks_ago=9 THEN evm_accounts::STRING END),
-    MAX(CASE WHEN weeks_ago=10 THEN evm_accounts::STRING END),
-    MAX(CASE WHEN weeks_ago=11 THEN evm_accounts::STRING END)
+  MAX(CASE WHEN weeks_ago = 0 THEN evm_accounts::STRING END),
+  MAX(CASE WHEN weeks_ago = 1 THEN evm_accounts::STRING END),
+  MAX(CASE WHEN weeks_ago = 2 THEN evm_accounts::STRING END),
+  MAX(CASE WHEN weeks_ago = 3 THEN evm_accounts::STRING END),
+  MAX(CASE WHEN weeks_ago = 4 THEN evm_accounts::STRING END),
+  MAX(CASE WHEN weeks_ago = 5 THEN evm_accounts::STRING END),
+  MAX(CASE WHEN weeks_ago = 6 THEN evm_accounts::STRING END),
+  MAX(CASE WHEN weeks_ago = 7 THEN evm_accounts::STRING END),
+  MAX(CASE WHEN weeks_ago = 8 THEN evm_accounts::STRING END),
+  MAX(CASE WHEN weeks_ago = 9 THEN evm_accounts::STRING END),
+  MAX(CASE WHEN weeks_ago = 10 THEN evm_accounts::STRING END),
+  MAX(CASE WHEN weeks_ago = 11 THEN evm_accounts::STRING END)
 FROM combined_metrics
+
 UNION ALL
 SELECT 'EVM % Change',
-    MAX(CASE WHEN weeks_ago=0 THEN evm_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=1 THEN evm_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=2 THEN evm_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=3 THEN evm_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=4 THEN evm_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=5 THEN evm_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=6 THEN evm_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=7 THEN evm_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=8 THEN evm_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=9 THEN evm_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=10 THEN evm_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=11 THEN evm_pct_change::STRING END)
+  MAX(CASE WHEN weeks_ago = 0 THEN evm_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 1 THEN evm_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 2 THEN evm_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 3 THEN evm_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 4 THEN evm_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 5 THEN evm_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 6 THEN evm_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 7 THEN evm_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 8 THEN evm_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 9 THEN evm_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 10 THEN evm_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 11 THEN evm_pct_change::STRING END)
 FROM combined_metrics
+
 UNION ALL
 SELECT '# total transacting wallets',
-    MAX(CASE WHEN weeks_ago=0 THEN total_accounts::STRING END),
-    MAX(CASE WHEN weeks_ago=1 THEN total_accounts::STRING END),
-    MAX(CASE WHEN weeks_ago=2 THEN total_accounts::STRING END),
-    MAX(CASE WHEN weeks_ago=3 THEN total_accounts::STRING END),
-    MAX(CASE WHEN weeks_ago=4 THEN total_accounts::STRING END),
-    MAX(CASE WHEN weeks_ago=5 THEN total_accounts::STRING END),
-    MAX(CASE WHEN weeks_ago=6 THEN total_accounts::STRING END),
-    MAX(CASE WHEN weeks_ago=7 THEN total_accounts::STRING END),
-    MAX(CASE WHEN weeks_ago=8 THEN total_accounts::STRING END),
-    MAX(CASE WHEN weeks_ago=9 THEN total_accounts::STRING END),
-    MAX(CASE WHEN weeks_ago=10 THEN total_accounts::STRING END),
-    MAX(CASE WHEN weeks_ago=11 THEN total_accounts::STRING END)
+  MAX(CASE WHEN weeks_ago = 0 THEN total_accounts::STRING END),
+  MAX(CASE WHEN weeks_ago = 1 THEN total_accounts::STRING END),
+  MAX(CASE WHEN weeks_ago = 2 THEN total_accounts::STRING END),
+  MAX(CASE WHEN weeks_ago = 3 THEN total_accounts::STRING END),
+  MAX(CASE WHEN weeks_ago = 4 THEN total_accounts::STRING END),
+  MAX(CASE WHEN weeks_ago = 5 THEN total_accounts::STRING END),
+  MAX(CASE WHEN weeks_ago = 6 THEN total_accounts::STRING END),
+  MAX(CASE WHEN weeks_ago = 7 THEN total_accounts::STRING END),
+  MAX(CASE WHEN weeks_ago = 8 THEN total_accounts::STRING END),
+  MAX(CASE WHEN weeks_ago = 9 THEN total_accounts::STRING END),
+  MAX(CASE WHEN weeks_ago = 10 THEN total_accounts::STRING END),
+  MAX(CASE WHEN weeks_ago = 11 THEN total_accounts::STRING END)
 FROM combined_metrics
+
 UNION ALL
 SELECT 'Total % Change',
-    MAX(CASE WHEN weeks_ago=0 THEN total_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=1 THEN total_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=2 THEN total_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=3 THEN total_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=4 THEN total_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=5 THEN total_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=6 THEN total_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=7 THEN total_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=8 THEN total_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=9 THEN total_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=10 THEN total_pct_change::STRING END),
-    MAX(CASE WHEN weeks_ago=11 THEN total_pct_change::STRING END)
+  MAX(CASE WHEN weeks_ago = 0 THEN total_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 1 THEN total_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 2 THEN total_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 3 THEN total_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 4 THEN total_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 5 THEN total_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 6 THEN total_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 7 THEN total_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 8 THEN total_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 9 THEN total_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 10 THEN total_pct_change::STRING END),
+  MAX(CASE WHEN weeks_ago = 11 THEN total_pct_change::STRING END)
 FROM combined_metrics
 """
 
