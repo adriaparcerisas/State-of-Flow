@@ -125,22 +125,24 @@ def run_query(sql: str) -> pd.DataFrame:
 def q(sql: str) -> pd.DataFrame:
     return run_query(sql)
 
-# define period selector somewhere near the top of the app
-PERIOD_LABELS = {
-    "All time": "all_time",
-    "Last year": "last_year",
-    "Last 3 months": "last_3_months",
-    "Last month": "last_month",
-    "Last week": "last_week",
-    "Last 24h": "last_24h",
-}
-selected_period_label = st.segmented_control(
-    "🟢 Period", list(PERIOD_LABELS.keys()), default="Last 3 months"
-)
-period_key = PERIOD_LABELS[selected_period_label]
+def qp(sql: str, period_key: str | None = None, *, default_period: str = "last_3_months") -> pd.DataFrame:
+    """
+    Query helper that renders {{Period}} and executes the SQL.
+    - period_key: optional explicit period (e.g., "last_week").
+    - If not provided, uses st.session_state["period_key"] or default_period.
+    """
+    pk = period_key or st.session_state.get("period_key") or default_period
+    sql_to_run = sql.replace("{{Period}}", pk) if "{{Period}}" in sql else sql
 
-def qp(sql: str) -> pd.DataFrame:
-    return run_query(render_sql(sql, period_key))
+    cur = get_conn().cursor()
+    try:
+        cur.execute(sql_to_run)
+        cols = [c[0] for c in cur.description] if cur.description else []
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+
+    return pd.DataFrame(rows, columns=cols)
 
 # ---------------- Sidebar ----------------
 with st.sidebar:
