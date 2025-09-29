@@ -489,7 +489,7 @@ SELECT
   type,
   active_users,
   rolling_avg
-FROM final_data
+FROM final_data where day<trunc(current_date,'week')
 ORDER BY day DESC, type
 """
 
@@ -549,6 +549,7 @@ combined_metrics AS (
     FROM weekly_periods wp
     LEFT JOIN cadence_accounts c ON wp.weeks_ago = c.weeks_ago
     LEFT JOIN evm_accounts e     ON wp.weeks_ago = e.weeks_ago
+    where wp.weeks_ago <trunc(current_date,'week')
 )
 SELECT 
     '# transacting wallets on Cadence' AS "New Addresses Created",
