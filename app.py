@@ -126,7 +126,7 @@ def q(sql: str) -> pd.DataFrame:
     return run_query(sql)
 
 def qp(sql: str) -> pd.DataFrame:
-    return q(sql.replace("{{Period}}", PERIOD))
+    return run_query(render_sql(sql, period_key))
 
 # ---------------- Sidebar ----------------
 with st.sidebar:
