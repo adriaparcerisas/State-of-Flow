@@ -125,6 +125,20 @@ def run_query(sql: str) -> pd.DataFrame:
 def q(sql: str) -> pd.DataFrame:
     return run_query(sql)
 
+# define period selector somewhere near the top of the app
+PERIOD_LABELS = {
+    "All time": "all_time",
+    "Last year": "last_year",
+    "Last 3 months": "last_3_months",
+    "Last month": "last_month",
+    "Last week": "last_week",
+    "Last 24h": "last_24h",
+}
+selected_period_label = st.segmented_control(
+    "🟢 Period", list(PERIOD_LABELS.keys()), default="Last 3 months"
+)
+period_key = PERIOD_LABELS[selected_period_label]
+
 def qp(sql: str) -> pd.DataFrame:
     return run_query(render_sql(sql, period_key))
 
