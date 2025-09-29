@@ -59,7 +59,6 @@ def render_footer():
             "- Flow Blockchain Roadmap: https://flow.com/flow-roadmap\n"
             "- Flow Blockchain Forum: https://forum.flow.com/\n"
             "- Flow Blockchain Primer: https://flow.com/primer\n"
-            "- Flow Blockchain Primer: PDF"
         )
     with c2:
         st.markdown("### The State of Flow Blockchain")
@@ -82,13 +81,6 @@ def render_footer():
             "enjoy both a great user experience and access to liquidity and infrastructure. The Flow ecosystem includes transformative features like user-friendly wallets, "
             "wallet-less onboarding, and sponsored transactions — facilitating a smoother user experience and encouraging broader adoption.\n\n"
             "For more information on the Flow blockchain check out their Primer.\n\n"
-            "This dashboard will explore Flow blockchains's recent Crescendo upgrade introducing EVM equivalence, along with Cadence. Below is a list of metrics featured in this dashboard:\n\n"
-            "• Transactions including EVM and Cadence\n"
-            "• Active wallets including EVM and Cadence\n"
-            "• Accounts created over-time\n"
-            "• Fees over-time\n"
-            "• Token supply including staked, locked, circulating, liquid and total\n"
-            "• Contracts deployed and deployers\n"
         )
 
 # ---------------- Snowflake ----------------
@@ -132,6 +124,9 @@ def run_query(sql: str) -> pd.DataFrame:
 
 def q(sql: str) -> pd.DataFrame:
     return run_query(sql)
+
+def qp(sql: str) -> pd.DataFrame:
+    return q(sql.replace("{{Period}}", PERIOD))
 
 # ---------------- Sidebar ----------------
 with st.sidebar:
@@ -353,6 +348,579 @@ FROM period_comparison
 ORDER BY period DESC;
 """
 
+# ---------- SQL: Active Accounts ----------
+SQL_ACTIVE_ACCOUNTS_TOTAL = """
+WITH time_periods AS (
+    SELECT CASE '{{Period}}'
+        WHEN 'all_time' THEN '2020-01-01'::DATE
+        WHEN 'last_year' THEN CURRENT_DATE - INTERVAL '1 YEAR'
+        WHEN 'last_3_months' THEN CURRENT_DATE - INTERVAL '3 MONTHS'
+        WHEN 'last_month' THEN CURRENT_DATE - INTERVAL '1 MONTH'
+        WHEN 'last_week' THEN CURRENT_DATE - INTERVAL '1 WEEK'
+        ELSE CURRENT_DATE - INTERVAL '1 DAY'
+    END AS start_date
+),
+active_addresses AS (
+    SELECT COUNT(DISTINCT CAST(a.value AS VARCHAR)) AS active_addresses
+    FROM flow.core.ez_transaction_actors b,
+         LATERAL FLATTEN(INPUT => b.actors) a
+    CROSS JOIN time_periods tp
+    WHERE b.block_timestamp >= tp.start_date
+
+    UNION ALL
+
+    SELECT COUNT(DISTINCT from_address) AS active_addresses
+    FROM flow.core_evm.fact_transactions ft
+    CROSS JOIN time_periods tp
+    WHERE ft.block_timestamp >= tp.start_date
+)
+SELECT SUM(active_addresses) AS total_active_addresses
+FROM active_addresses
+"""
+
+SQL_ACTIVE_ACCOUNTS_EVM = """
+WITH time_periods AS (
+    SELECT CASE '{{Period}}'
+        WHEN 'all_time' THEN '2020-01-01'::DATE
+        WHEN 'last_year' THEN CURRENT_DATE - INTERVAL '1 YEAR'
+        WHEN 'last_3_months' THEN CURRENT_DATE - INTERVAL '3 MONTHS'
+        WHEN 'last_month' THEN CURRENT_DATE - INTERVAL '1 MONTH'
+        WHEN 'last_week' THEN CURRENT_DATE - INTERVAL '1 WEEK'
+        ELSE CURRENT_DATE - INTERVAL '1 DAY'
+    END AS start_date, CURRENT_DATE AS end_date
+)
+SELECT COUNT(DISTINCT from_address) AS total_active_addresses
+FROM flow.core_evm.fact_transactions ft
+CROSS JOIN time_periods tp
+WHERE ft.block_timestamp >= tp.start_date
+  AND ft.block_timestamp <  tp.end_date
+"""
+
+SQL_ACTIVE_ACCOUNTS_TIMESERIES = """
+WITH base_data AS (
+    SELECT
+        CASE '{{Period}}'
+            WHEN 'all_time' THEN DATE_TRUNC('month', b.block_timestamp)
+            WHEN 'last_year' THEN DATE_TRUNC('week', b.block_timestamp)
+            WHEN 'last_3_months' THEN DATE_TRUNC('week', b.block_timestamp)
+            WHEN 'last_month' THEN DATE_TRUNC('day', b.block_timestamp)
+            WHEN 'last_week' THEN DATE_TRUNC('day', b.block_timestamp)
+            WHEN 'last_24h' THEN DATE_TRUNC('hour', b.block_timestamp)
+        END AS time_stamp,
+        'Cadence' AS type,
+        COUNT(DISTINCT CAST(a.value AS VARCHAR)) AS active_users
+    FROM flow.core.ez_transaction_actors b,
+         LATERAL FLATTEN(INPUT => b.actors) a
+    WHERE b.block_timestamp >= CASE '{{Period}}'
+        WHEN 'all_time' THEN '2020-01-01'::DATE
+        WHEN 'last_year' THEN CURRENT_DATE - INTERVAL '1 YEAR'
+        WHEN 'last_3_months' THEN CURRENT_DATE - INTERVAL '3 MONTHS'
+        WHEN 'last_month' THEN CURRENT_DATE - INTERVAL '1 MONTH'
+        WHEN 'last_week' THEN CURRENT_DATE - INTERVAL '1 WEEK'
+        WHEN 'last_24h' THEN CURRENT_DATE - INTERVAL '1 DAY'
+    END
+    GROUP BY 1,2
+
+    UNION ALL
+
+    SELECT
+        CASE '{{Period}}'
+            WHEN 'all_time' THEN DATE_TRUNC('month', block_timestamp)
+            WHEN 'last_year' THEN DATE_TRUNC('week', block_timestamp)
+            WHEN 'last_3_months' THEN DATE_TRUNC('week', block_timestamp)
+            WHEN 'last_month' THEN DATE_TRUNC('day', block_timestamp)
+            WHEN 'last_week' THEN DATE_TRUNC('day', block_timestamp)
+            WHEN 'last_24h' THEN DATE_TRUNC('hour', block_timestamp)
+        END AS time_stamp,
+        'EVM' AS type,
+        COUNT(DISTINCT from_address) AS active_users
+    FROM flow.core_evm.fact_transactions
+    WHERE block_timestamp >= CASE '{{Period}}'
+        WHEN 'all_time' THEN '2020-01-01'::DATE
+        WHEN 'last_year' THEN CURRENT_DATE - INTERVAL '1 YEAR'
+        WHEN 'last_3_months' THEN CURRENT_DATE - INTERVAL '3 MONTHS'
+        WHEN 'last_month' THEN CURRENT_DATE - INTERVAL '1 MONTH'
+        WHEN 'last_week' THEN CURRENT_DATE - INTERVAL '1 WEEK'
+        WHEN 'last_24h' THEN CURRENT_DATE - INTERVAL '1 DAY'
+    END
+    GROUP BY 1,2
+),
+aggregated_data AS (
+    SELECT time_stamp AS day, type, active_users
+    FROM base_data
+    WHERE time_stamp < CASE '{{Period}}'
+        WHEN 'all_time' THEN DATE_TRUNC('month', current_date)
+        WHEN 'last_year' THEN DATE_TRUNC('week', current_date)
+        WHEN 'last_3_months' THEN DATE_TRUNC('week', current_date)
+        WHEN 'last_month' THEN DATE_TRUNC('day', current_date)
+        WHEN 'last_week' THEN DATE_TRUNC('day', current_date)
+        WHEN 'last_24h' THEN DATE_TRUNC('hour', current_date)
+    END
+
+    UNION ALL
+
+    SELECT time_stamp AS day, 'EVM + Cadence' AS type, SUM(active_users) AS active_users
+    FROM base_data
+    GROUP BY 1,2
+),
+final_data AS (
+    SELECT
+        day, type, active_users,
+        CASE WHEN type = 'EVM + Cadence'
+             THEN AVG(active_users) OVER (PARTITION BY type ORDER BY day ROWS BETWEEN 3 PRECEDING AND CURRENT ROW)
+        END AS rolling_avg
+    FROM aggregated_data
+)
+SELECT day, type, active_users, rolling_avg
+FROM final_data
+WHERE day < TRUNC(current_date,'week')
+ORDER BY day DESC, type
+"""
+
+SQL_ACTIVE_ACCOUNTS_WEEK_TABLE = """
+WITH weekly_periods AS (
+    SELECT 
+        CASE WHEN num=0 THEN DATE_TRUNC('week', CURRENT_DATE)
+             ELSE dateadd('week', -num, current_date) END AS start_date,
+        CASE WHEN num=0 THEN CURRENT_TIMESTAMP
+             ELSE dateadd('week', -num+1, current_date) END AS end_date,
+        num AS weeks_ago,
+        TO_CHAR(CASE WHEN num=0 THEN DATE_TRUNC('week', CURRENT_DATE)
+                     ELSE dateadd('week', -num, current_date) END,'YYYY-MM-DD') || ' to ' ||
+        TO_CHAR(CASE WHEN num=0 THEN CURRENT_DATE
+                     ELSE dateadd('week', -num+1, current_date) END,'YYYY-MM-DD') AS date_range
+    FROM (SELECT row_number() over (order by seq4()) - 1 AS num
+          FROM table(generator(rowcount => 12)))
+),
+cadence_accounts AS (
+    SELECT wp.weeks_ago, wp.date_range,
+           COUNT(DISTINCT first_tx.value) AS new_accounts
+    FROM weekly_periods wp
+    LEFT JOIN (
+        SELECT a.value, MIN(block_timestamp) AS first_tx_time
+        FROM flow.core.ez_transaction_actors,
+             LATERAL FLATTEN(INPUT => actors) a
+        GROUP BY a.value
+    ) first_tx
+      ON first_tx.first_tx_time >= wp.start_date AND first_tx.first_tx_time < wp.end_date
+    GROUP BY wp.weeks_ago, wp.date_range
+),
+evm_accounts AS (
+    SELECT wp.weeks_ago, wp.date_range,
+           COUNT(DISTINCT from_address) AS new_accounts
+    FROM weekly_periods wp
+    LEFT JOIN (
+        SELECT from_address, MIN(block_timestamp) AS first_tx_time
+        FROM flow.core_evm.fact_transactions
+        GROUP BY from_address
+    ) t
+      ON t.first_tx_time >= wp.start_date AND t.first_tx_time < wp.end_date
+    GROUP BY wp.weeks_ago, wp.date_range
+),
+combined_metrics AS (
+    SELECT 
+        wp.weeks_ago, wp.date_range,
+        c.new_accounts AS cadence_accounts,
+        ROUND(((c.new_accounts - LAG(c.new_accounts) OVER (ORDER BY wp.weeks_ago DESC)) /
+              NULLIF(LAG(c.new_accounts) OVER (ORDER BY wp.weeks_ago DESC),0) * 100),2) AS cadence_pct_change,
+        e.new_accounts AS evm_accounts,
+        ROUND(((e.new_accounts - LAG(e.new_accounts) OVER (ORDER BY wp.weeks_ago DESC)) /
+              NULLIF(LAG(e.new_accounts) OVER (ORDER BY wp.weeks_ago DESC),0) * 100),2) AS evm_pct_change,
+        (c.new_accounts + e.new_accounts) AS total_accounts,
+        ROUND((((c.new_accounts + e.new_accounts) -
+              LAG(c.new_accounts + e.new_accounts) OVER (ORDER BY wp.weeks_ago DESC)) /
+              NULLIF(LAG(c.new_accounts + e.new_accounts) OVER (ORDER BY wp.weeks_ago DESC),0) * 100),2) AS total_pct_change
+    FROM weekly_periods wp
+    LEFT JOIN cadence_accounts c ON wp.weeks_ago = c.weeks_ago
+    LEFT JOIN evm_accounts e     ON wp.weeks_ago = e.weeks_ago
+)
+SELECT 
+    '# transacting wallets on Cadence' AS "New Addresses Created",
+    MAX(CASE WHEN weeks_ago=0 THEN cadence_accounts::STRING END) AS "Current Week",
+    MAX(CASE WHEN weeks_ago=1 THEN cadence_accounts::STRING END) AS "Last Week",
+    MAX(CASE WHEN weeks_ago=2 THEN cadence_accounts::STRING END) AS "2 Weeks Ago",
+    MAX(CASE WHEN weeks_ago=3 THEN cadence_accounts::STRING END) AS "3 Weeks Ago",
+    MAX(CASE WHEN weeks_ago=4 THEN cadence_accounts::STRING END) AS "4 Weeks Ago",
+    MAX(CASE WHEN weeks_ago=5 THEN cadence_accounts::STRING END) AS "5 Weeks Ago",
+    MAX(CASE WHEN weeks_ago=6 THEN cadence_accounts::STRING END) AS "6 Weeks Ago",
+    MAX(CASE WHEN weeks_ago=7 THEN cadence_accounts::STRING END) AS "7 Weeks Ago",
+    MAX(CASE WHEN weeks_ago=8 THEN cadence_accounts::STRING END) AS "8 Weeks Ago",
+    MAX(CASE WHEN weeks_ago=9 THEN cadence_accounts::STRING END) AS "9 Weeks Ago",
+    MAX(CASE WHEN weeks_ago=10 THEN cadence_accounts::STRING END) AS "10 Weeks Ago",
+    MAX(CASE WHEN weeks_ago=11 THEN cadence_accounts::STRING END) AS "11 Weeks Ago"
+FROM combined_metrics
+UNION ALL
+SELECT 'Cadence % Change',
+    MAX(CASE WHEN weeks_ago=0 THEN cadence_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=1 THEN cadence_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=2 THEN cadence_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=3 THEN cadence_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=4 THEN cadence_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=5 THEN cadence_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=6 THEN cadence_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=7 THEN cadence_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=8 THEN cadence_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=9 THEN cadence_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=10 THEN cadence_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=11 THEN cadence_pct_change::STRING END)
+FROM combined_metrics
+UNION ALL
+SELECT '# transacting wallets on EVM',
+    MAX(CASE WHEN weeks_ago=0 THEN evm_accounts::STRING END),
+    MAX(CASE WHEN weeks_ago=1 THEN evm_accounts::STRING END),
+    MAX(CASE WHEN weeks_ago=2 THEN evm_accounts::STRING END),
+    MAX(CASE WHEN weeks_ago=3 THEN evm_accounts::STRING END),
+    MAX(CASE WHEN weeks_ago=4 THEN evm_accounts::STRING END),
+    MAX(CASE WHEN weeks_ago=5 THEN evm_accounts::STRING END),
+    MAX(CASE WHEN weeks_ago=6 THEN evm_accounts::STRING END),
+    MAX(CASE WHEN weeks_ago=7 THEN evm_accounts::STRING END),
+    MAX(CASE WHEN weeks_ago=8 THEN evm_accounts::STRING END),
+    MAX(CASE WHEN weeks_ago=9 THEN evm_accounts::STRING END),
+    MAX(CASE WHEN weeks_ago=10 THEN evm_accounts::STRING END),
+    MAX(CASE WHEN weeks_ago=11 THEN evm_accounts::STRING END)
+FROM combined_metrics
+UNION ALL
+SELECT 'EVM % Change',
+    MAX(CASE WHEN weeks_ago=0 THEN evm_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=1 THEN evm_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=2 THEN evm_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=3 THEN evm_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=4 THEN evm_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=5 THEN evm_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=6 THEN evm_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=7 THEN evm_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=8 THEN evm_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=9 THEN evm_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=10 THEN evm_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=11 THEN evm_pct_change::STRING END)
+FROM combined_metrics
+UNION ALL
+SELECT '# total transacting wallets',
+    MAX(CASE WHEN weeks_ago=0 THEN total_accounts::STRING END),
+    MAX(CASE WHEN weeks_ago=1 THEN total_accounts::STRING END),
+    MAX(CASE WHEN weeks_ago=2 THEN total_accounts::STRING END),
+    MAX(CASE WHEN weeks_ago=3 THEN total_accounts::STRING END),
+    MAX(CASE WHEN weeks_ago=4 THEN total_accounts::STRING END),
+    MAX(CASE WHEN weeks_ago=5 THEN total_accounts::STRING END),
+    MAX(CASE WHEN weeks_ago=6 THEN total_accounts::STRING END),
+    MAX(CASE WHEN weeks_ago=7 THEN total_accounts::STRING END),
+    MAX(CASE WHEN weeks_ago=8 THEN total_accounts::STRING END),
+    MAX(CASE WHEN weeks_ago=9 THEN total_accounts::STRING END),
+    MAX(CASE WHEN weeks_ago=10 THEN total_accounts::STRING END),
+    MAX(CASE WHEN weeks_ago=11 THEN total_accounts::STRING END)
+FROM combined_metrics
+UNION ALL
+SELECT 'Total % Change',
+    MAX(CASE WHEN weeks_ago=0 THEN total_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=1 THEN total_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=2 THEN total_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=3 THEN total_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=4 THEN total_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=5 THEN total_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=6 THEN total_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=7 THEN total_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=8 THEN total_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=9 THEN total_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=10 THEN total_pct_change::STRING END),
+    MAX(CASE WHEN weeks_ago=11 THEN total_pct_change::STRING END)
+FROM combined_metrics
+"""
+
+# ---------- SQL: Accounts Created ----------
+SQL_ACCOUNTS_CREATED_NUMBER = """
+WITH base_data AS (
+    SELECT 
+        CASE '{{Period}}'
+            WHEN 'all_time' THEN DATE_TRUNC('month', block_timestamp)
+            WHEN 'last_year' THEN DATE_TRUNC('week', block_timestamp)
+            WHEN 'last_3_months' THEN DATE_TRUNC('week', block_timestamp)
+            WHEN 'last_month' THEN DATE_TRUNC('day', block_timestamp)
+            WHEN 'last_week' THEN DATE_TRUNC('day', block_timestamp)
+            WHEN 'last_24h' THEN DATE_TRUNC('hour', block_timestamp)
+        END AS time_stamp,
+        actor_address
+    FROM (
+        SELECT b.block_timestamp, CAST(a.value AS VARCHAR) AS actor_address
+        FROM flow.core.ez_transaction_actors b,
+             LATERAL FLATTEN(INPUT => b.actors) a
+        WHERE b.block_timestamp >= CASE '{{Period}}'
+            WHEN 'all_time' THEN '2020-01-01'::DATE
+            WHEN 'last_year' THEN CURRENT_DATE - INTERVAL '1 YEAR'
+            WHEN 'last_3_months' THEN CURRENT_DATE - INTERVAL '3 MONTHS'
+            WHEN 'last_month' THEN CURRENT_DATE - INTERVAL '1 MONTH'
+            WHEN 'last_week' THEN CURRENT_DATE - INTERVAL '1 WEEK'
+            WHEN 'last_24h' THEN CURRENT_DATE - INTERVAL '1 DAY'
+        END
+        UNION ALL
+        SELECT block_timestamp, from_address AS actor_address
+        FROM flow.core_evm.fact_transactions
+        WHERE block_timestamp >= CASE '{{Period}}'
+            WHEN 'all_time' THEN '2020-01-01'::DATE
+            WHEN 'last_year' THEN CURRENT_DATE - INTERVAL '1 YEAR'
+            WHEN 'last_3_months' THEN CURRENT_DATE - INTERVAL '3 MONTHS'
+            WHEN 'last_month' THEN CURRENT_DATE - INTERVAL '1 MONTH'
+            WHEN 'last_week' THEN CURRENT_DATE - INTERVAL '1 WEEK'
+            WHEN 'last_24h' THEN CURRENT_DATE - INTERVAL '1 DAY'
+        END
+    )
+    WHERE time_stamp < CASE '{{Period}}'
+        WHEN 'all_time' THEN DATE_TRUNC('month', current_date)
+        WHEN 'last_year' THEN DATE_TRUNC('week', current_date)
+        WHEN 'last_3_months' THEN DATE_TRUNC('week', current_date)
+        WHEN 'last_month' THEN DATE_TRUNC('day', current_date)
+        WHEN 'last_week' THEN DATE_TRUNC('day', current_date)
+        WHEN 'last_24h' THEN DATE_TRUNC('hour', current_date)
+    END
+),
+new_accounts AS (
+    SELECT COUNT(DISTINCT actor_address) AS daily_new_accounts
+    FROM (
+        SELECT time_stamp, actor_address,
+               ROW_NUMBER() OVER (PARTITION BY actor_address ORDER BY time_stamp) AS rn
+        FROM base_data
+    )
+    WHERE rn = 1
+)
+SELECT daily_new_accounts AS total_new_accounts_last_24h
+FROM new_accounts
+"""
+
+SQL_ACCOUNTS_CREATED_TIMESERIES = """
+WITH base_data AS (
+    SELECT 
+        CASE '{{Period}}'
+            WHEN 'all_time' THEN DATE_TRUNC('month', block_timestamp)
+            WHEN 'last_year' THEN DATE_TRUNC('week', block_timestamp)
+            WHEN 'last_3_months' THEN DATE_TRUNC('week', block_timestamp)
+            WHEN 'last_month' THEN DATE_TRUNC('day', block_timestamp)
+            WHEN 'last_week' THEN DATE_TRUNC('day', block_timestamp)
+            WHEN 'last_24h' THEN DATE_TRUNC('hour', block_timestamp)
+        END AS time_stamp,
+        actor_address
+    FROM (
+        SELECT b.block_timestamp, CAST(a.value AS VARCHAR) AS actor_address
+        FROM flow.core.ez_transaction_actors b,
+             LATERAL FLATTEN(INPUT => b.actors) a
+        WHERE b.block_timestamp >= CASE '{{Period}}'
+            WHEN 'all_time' THEN '2020-01-01'::DATE
+            WHEN 'last_year' THEN CURRENT_DATE - INTERVAL '1 YEAR'
+            WHEN 'last_3_months' THEN CURRENT_DATE - INTERVAL '3 MONTHS'
+            WHEN 'last_month' THEN CURRENT_DATE - INTERVAL '1 MONTH'
+            WHEN 'last_week' THEN CURRENT_DATE - INTERVAL '1 WEEK'
+            WHEN 'last_24h' THEN CURRENT_DATE - INTERVAL '1 DAY'
+        END
+        UNION ALL
+        SELECT block_timestamp, from_address AS actor_address
+        FROM flow.core_evm.fact_transactions
+        WHERE block_timestamp >= CASE '{{Period}}'
+            WHEN 'all_time' THEN '2020-01-01'::DATE
+            WHEN 'last_year' THEN CURRENT_DATE - INTERVAL '1 YEAR'
+            WHEN 'last_3_months' THEN CURRENT_DATE - INTERVAL '3 MONTHS'
+            WHEN 'last_month' THEN CURRENT_DATE - INTERVAL '1 MONTH'
+            WHEN 'last_week' THEN CURRENT_DATE - INTERVAL '1 WEEK'
+            WHEN 'last_24h' THEN CURRENT_DATE - INTERVAL '1 DAY'
+        END
+    )
+    WHERE time_stamp < CASE '{{Period}}'
+        WHEN 'all_time' THEN DATE_TRUNC('month', current_date)
+        WHEN 'last_year' THEN DATE_TRUNC('week', current_date)
+        WHEN 'last_3_months' THEN DATE_TRUNC('week', current_date)
+        WHEN 'last_month' THEN DATE_TRUNC('day', current_date)
+        WHEN 'last_week' THEN DATE_TRUNC('day', current_date)
+        WHEN 'last_24h' THEN DATE_TRUNC('hour', current_date)
+    END
+),
+new_accounts AS (
+    SELECT time_stamp AS day,
+           COUNT(DISTINCT actor_address) AS daily_new_accounts
+    FROM (
+        SELECT time_stamp, actor_address,
+               ROW_NUMBER() OVER (PARTITION BY actor_address ORDER BY time_stamp) AS rn
+        FROM base_data
+    )
+    WHERE rn = 1
+    GROUP BY time_stamp
+)
+SELECT
+    day,
+    daily_new_accounts,
+    SUM(daily_new_accounts) OVER (ORDER BY day) AS total_new_accounts,
+    AVG(daily_new_accounts) OVER (ORDER BY day ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS rolling_avg_new_accounts
+FROM new_accounts
+ORDER BY day DESC
+"""
+
+# ---------- SQL: New / Active / Total Accounts ----------
+SQL_NAT_ACTIVE_NUMBER = SQL_ACTIVE_ACCOUNTS_TOTAL  # reuse
+
+SQL_NAT_NEW_NUMBER = SQL_ACCOUNTS_CREATED_NUMBER   # reuse
+
+SQL_NAT_TOTAL_NUMBER = """
+WITH time_periods AS (
+    SELECT '2020-01-01'::DATE AS start_date
+),
+new_accounts_last_24h AS (
+    SELECT COUNT(DISTINCT CAST(a.value AS VARCHAR)) AS new_accounts_24h
+    FROM flow.core.ez_transaction_actors b,
+         LATERAL FLATTEN(INPUT => b.actors) a, time_periods tp
+    WHERE b.block_timestamp >= tp.start_date
+      AND b.block_timestamp <= CURRENT_DATE
+
+    UNION ALL
+
+    SELECT COUNT(DISTINCT from_address) AS new_accounts_24h
+    FROM flow.core_evm.fact_transactions ft
+    CROSS JOIN time_periods tp
+    WHERE ft.block_timestamp >= tp.start_date
+      AND ft.block_timestamp <= CURRENT_DATE
+),
+new_num AS (
+    SELECT SUM(new_accounts_24h) AS total_new_accounts_last_24h
+    FROM new_accounts_last_24h
+)
+SELECT total_new_accounts_last_24h
+FROM new_num
+"""
+
+SQL_NAT_TIMESERIES = """
+WITH base_data AS (
+    SELECT
+        CASE '{{Period}}'
+            WHEN 'all_time' THEN DATE_TRUNC('month', b.block_timestamp)
+            WHEN 'last_year' THEN DATE_TRUNC('week', b.block_timestamp)
+            WHEN 'last_3_months' THEN DATE_TRUNC('week', b.block_timestamp)
+            WHEN 'last_month' THEN DATE_TRUNC('day', b.block_timestamp)
+            WHEN 'last_week' THEN DATE_TRUNC('day', b.block_timestamp)
+            WHEN 'last_24h' THEN DATE_TRUNC('hour', b.block_timestamp)
+        END AS time_stamp,
+        'Cadence' AS type,
+        COUNT(DISTINCT CAST(a.value AS VARCHAR)) AS active_users
+    FROM flow.core.ez_transaction_actors b,
+         LATERAL FLATTEN(INPUT => b.actors) a
+    WHERE b.block_timestamp >= CASE '{{Period}}'
+        WHEN 'all_time' THEN '2020-01-01'::DATE
+        WHEN 'last_year' THEN CURRENT_DATE - INTERVAL '1 YEAR'
+        WHEN 'last_3_months' THEN CURRENT_DATE - INTERVAL '3 MONTHS'
+        WHEN 'last_month' THEN CURRENT_DATE - INTERVAL '1 MONTH'
+        WHEN 'last_week' THEN CURRENT_DATE - INTERVAL '1 WEEK'
+        WHEN 'last_24h' THEN CURRENT_DATE - INTERVAL '1 DAY'
+    END
+    GROUP BY 1,2
+
+    UNION ALL
+
+    SELECT
+        CASE '{{Period}}'
+            WHEN 'all_time' THEN DATE_TRUNC('month', block_timestamp)
+            WHEN 'last_year' THEN DATE_TRUNC('week', block_timestamp)
+            WHEN 'last_3_months' THEN DATE_TRUNC('week', block_timestamp)
+            WHEN 'last_month' THEN DATE_TRUNC('day', block_timestamp)
+            WHEN 'last_week' THEN DATE_TRUNC('day', block_timestamp)
+            WHEN 'last_24h' THEN DATE_TRUNC('hour', block_timestamp)
+        END AS time_stamp,
+        'EVM' AS type,
+        COUNT(DISTINCT from_address) AS active_users
+    FROM flow.core_evm.fact_transactions
+    WHERE block_timestamp >= CASE '{{Period}}'
+        WHEN 'all_time' THEN '2020-01-01'::DATE
+        WHEN 'last_year' THEN CURRENT_DATE - INTERVAL '1 YEAR'
+        WHEN 'last_3_months' THEN CURRENT_DATE - INTERVAL '3 MONTHS'
+        WHEN 'last_month' THEN CURRENT_DATE - INTERVAL '1 MONTH'
+        WHEN 'last_week' THEN CURRENT_DATE - INTERVAL '1 WEEK'
+        WHEN 'last_24h' THEN CURRENT_DATE - INTERVAL '1 DAY'
+    END
+    GROUP BY 1,2
+),
+aggregated_data AS (
+    SELECT time_stamp AS day, SUM(active_users) AS active_users
+    FROM base_data
+    GROUP BY 1
+),
+final_data AS (
+    SELECT day, active_users,
+           AVG(active_users) OVER (ORDER BY day ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS rolling_avg_active_users
+    FROM aggregated_data
+),
+base_data2 AS (
+    SELECT 
+        CASE '{{Period}}'
+            WHEN 'all_time' THEN DATE_TRUNC('month', block_timestamp)
+            WHEN 'last_year' THEN DATE_TRUNC('week', block_timestamp)
+            WHEN 'last_3_months' THEN DATE_TRUNC('week', block_timestamp)
+            WHEN 'last_month' THEN DATE_TRUNC('day', block_timestamp)
+            WHEN 'last_week' THEN DATE_TRUNC('day', block_timestamp)
+            WHEN 'last_24h' THEN DATE_TRUNC('hour', block_timestamp)
+        END AS time_stamp,
+        actor_address
+    FROM (
+        SELECT b.block_timestamp, CAST(a.value AS VARCHAR) AS actor_address
+        FROM flow.core.ez_transaction_actors b,
+             LATERAL FLATTEN(INPUT => b.actors) a
+        WHERE b.block_timestamp >= CASE '{{Period}}'
+            WHEN 'all_time' THEN '2020-01-01'::DATE
+            WHEN 'last_year' THEN CURRENT_DATE - INTERVAL '1 YEAR'
+            WHEN 'last_3_months' THEN CURRENT_DATE - INTERVAL '3 MONTHS'
+            WHEN 'last_month' THEN CURRENT_DATE - INTERVAL '1 MONTH'
+            WHEN 'last_week' THEN CURRENT_DATE - INTERVAL '1 WEEK'
+            WHEN 'last_24h' THEN CURRENT_DATE - INTERVAL '1 DAY'
+        END
+
+        UNION ALL
+
+        SELECT block_timestamp, from_address AS actor_address
+        FROM flow.core_evm.fact_transactions
+        WHERE block_timestamp >= CASE '{{Period}}'
+            WHEN 'all_time' THEN '2020-01-01'::DATE
+            WHEN 'last_year' THEN CURRENT_DATE - INTERVAL '1 YEAR'
+            WHEN 'last_3_months' THEN CURRENT_DATE - INTERVAL '3 MONTHS'
+            WHEN 'last_month' THEN CURRENT_DATE - INTERVAL '1 MONTH'
+            WHEN 'last_week' THEN CURRENT_DATE - INTERVAL '1 WEEK'
+            WHEN 'last_24h' THEN CURRENT_DATE - INTERVAL '1 DAY'
+        END
+    )
+    WHERE time_stamp < CASE '{{Period}}'
+        WHEN 'all_time' THEN DATE_TRUNC('month', current_date)
+        WHEN 'last_year' THEN DATE_TRUNC('week', current_date)
+        WHEN 'last_3_months' THEN DATE_TRUNC('week', current_date)
+        WHEN 'last_month' THEN DATE_TRUNC('day', current_date)
+        WHEN 'last_week' THEN DATE_TRUNC('day', current_date)
+        WHEN 'last_24h' THEN DATE_TRUNC('hour', current_date)
+    END
+),
+new_accounts AS (
+    SELECT time_stamp AS day,
+           COUNT(DISTINCT actor_address) AS daily_new_accounts
+    FROM (
+        SELECT time_stamp, actor_address,
+               ROW_NUMBER() OVER (PARTITION BY actor_address ORDER BY time_stamp) AS rn
+        FROM base_data2
+    )
+    WHERE rn = 1
+    GROUP BY time_stamp
+),
+final_data2 AS (
+    SELECT
+        day,
+        daily_new_accounts,
+        SUM(daily_new_accounts) OVER (ORDER BY day) AS total_new_accounts,
+        AVG(daily_new_accounts) OVER (ORDER BY day ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS rolling_avg_new_accounts
+    FROM new_accounts
+    ORDER BY day DESC
+)
+SELECT 
+    IFNULL(x.day,y.day) AS date,
+    x.active_users,
+    x.rolling_avg_active_users,
+    y.daily_new_accounts AS new_accounts,
+    y.rolling_avg_new_accounts,
+    y.total_new_accounts
+FROM final_data x
+JOIN final_data2 y ON x.day = y.day
+ORDER BY date DESC
+"""
+
+
+
 # ---------------- Layout ----------------
 st.title("🟢 State of Flow — Overview Dashboard")
 
@@ -521,35 +1089,232 @@ with tabs[0]:
 # ==========================
 with tabs[1]:
     st.subheader("Active Accounts")
-    st.info("Coming next: period-aware DAU (total / Cadence / EVM), moving averages, and splits.")
+    CADENCE_COLOR = "#4F46E5"  # indigo
+    EVM_COLOR     = "#22C55E"  # green
+    TOTAL_COLOR   = "#0EA5E9"  # cyan
+    NEUTRAL_LINE  = "#64748B"  # slate
+
+    c1, c2 = st.columns(2)
+    try:
+        n_total = qp(SQL_ACTIVE_ACCOUNTS_TOTAL)
+        c1.metric("Active Accounts — EVM + Cadence", f"{int(n_total.iloc[0,0]):,}")
+    except Exception as e:
+        c1.info("No data.")
+
+    try:
+        n_evm = qp(SQL_ACTIVE_ACCOUNTS_EVM)
+        c2.metric("Active Accounts — EVM", f"{int(n_evm.iloc[0,0]):,}")
+    except Exception:
+        c2.info("No data.")
+
+    # Timeseries: bars (total) + lines (Cadence/EVM) + rolling avg
+    import altair as alt
+    try:
+        df = qp(SQL_ACTIVE_ACCOUNTS_TIMESERIES).copy()
+        df["day"] = pd.to_datetime(df["DAY"])
+        df["active_users"] = pd.to_numeric(df["ACTIVE_USERS"])
+        df["rolling_avg"] = pd.to_numeric(df["ROLLING_AVG"])
+
+        total_df   = df[df["TYPE"]=="EVM + Cadence"]
+        cadence_df = df[df["TYPE"]=="Cadence"]
+        evm_df     = df[df["TYPE"]=="EVM"]
+
+        bars = alt.Chart(total_df).mark_bar().encode(
+            x=alt.X("day:T", title="Date"),
+            y=alt.Y("active_users:Q", title="Active Accounts"),
+            tooltip=["day:T","active_users:Q"]
+        ).properties(height=320)
+
+        line_cadence = alt.Chart(cadence_df).mark_line(point=False, strokeWidth=2, color=CADENCE_COLOR).encode(
+            x="day:T", y="active_users:Q", tooltip=["day:T","active_users:Q"]
+        )
+
+        line_evm = alt.Chart(evm_df).mark_line(point=False, strokeWidth=2, color=EVM_COLOR).encode(
+            x="day:T", y="active_users:Q", tooltip=["day:T","active_users:Q"]
+        )
+
+        roll = alt.Chart(total_df.dropna(subset=["rolling_avg"])).mark_line(strokeDash=[6,4], color=NEUTRAL_LINE, strokeWidth=2).encode(
+            x="day:T", y=alt.Y("rolling_avg:Q", title="Active Accounts (roll avg)"),
+            tooltip=["day:T","rolling_avg:Q"]
+        )
+
+        st.altair_chart(bars + line_cadence + line_evm + roll, use_container_width=True)
+    except Exception as e:
+        st.warning(f"Could not render active accounts timeseries: {e}")
+
+    st.markdown("#### Table of New Addresses Created over the past 12 weeks")
+    try:
+        w = q(SQL_ACTIVE_ACCOUNTS_WEEK_TABLE)
+        st.dataframe(w, use_container_width=True, hide_index=True)
+    except Exception:
+        st.info("No weekly table data.")
+
+    with st.expander("Methodology"):
+        st.markdown("""
+This query calculates the daily count of active users by day from two sources: **flow.core.ez_transaction_actors** and **flow.core_evm.fact_transactions**. By aggregating unique active users across both sources, it provides a consolidated view of user activity each day.
+
+- **Daily Active Users**: Counts distinct users (actors and EVM addresses) per day.
+- **Aggregated Active User Totals**: Sum across sources for total daily activity.
+
+This offers a straightforward way to monitor user engagement across **Flow Cadence** and **Flow EVM**.
+        """)
     render_footer()
 
 with tabs[2]:
     st.subheader("Accounts Created")
-    st.info("Coming next: new accounts over time, moving averages, and change vs prior window.")
+    CADENCE_COLOR = "#4F46E5"  # indigo
+    EVM_COLOR     = "#22C55E"  # green
+    TOTAL_COLOR   = "#0EA5E9"  # cyan
+    NEUTRAL_LINE  = "#64748B"  # slate
+    # KPI
+    try:
+        k = qp(SQL_ACCOUNTS_CREATED_NUMBER)
+        st.metric("Accounts Created — EVM + Cadence", f"{int(k.iloc[0,0]):,}")
+    except Exception:
+        st.info("No data.")
+
+    # Timeseries
+    try:
+        df = qp(SQL_ACCOUNTS_CREATED_TIMESERIES).copy()
+        df["DAY"] = pd.to_datetime(df["DAY"])
+        df["DAILY_NEW_ACCOUNTS"] = pd.to_numeric(df["DAILY_NEW_ACCOUNTS"])
+        df["TOTAL_NEW_ACCOUNTS"] = pd.to_numeric(df["TOTAL_NEW_ACCOUNTS"])
+        df["ROLLING_AVG_NEW_ACCOUNTS"] = pd.to_numeric(df["ROLLING_AVG_NEW_ACCOUNTS"])
+
+        import altair as alt
+        bars = alt.Chart(df).mark_bar(color=TOTAL_COLOR).encode(
+            x=alt.X("DAY:T", title="Date"),
+            y=alt.Y("DAILY_NEW_ACCOUNTS:Q", title="Daily New Accounts"),
+            tooltip=["DAY:T","DAILY_NEW_ACCOUNTS:Q"]
+        ).properties(height=320)
+
+        rolling = alt.Chart(df.dropna(subset=["ROLLING_AVG_NEW_ACCOUNTS"])).mark_line(
+            strokeDash=[6,4], strokeWidth=2, color=NEUTRAL_LINE
+        ).encode(
+            x="DAY:T", y="ROLLING_AVG_NEW_ACCOUNTS:Q", tooltip=["DAY:T","ROLLING_AVG_NEW_ACCOUNTS:Q"]
+        )
+
+        cum = alt.Chart(df).mark_line(strokeWidth=2, color=CADENCE_COLOR).encode(
+            x="DAY:T", y=alt.Y("TOTAL_NEW_ACCOUNTS:Q", title="Cumulative New Accounts"),
+            tooltip=["DAY:T","TOTAL_NEW_ACCOUNTS:Q"]
+        )
+
+        st.altair_chart(bars + rolling + cum, use_container_width=True)
+    except Exception as e:
+        st.warning(f"Could not render Accounts Created chart: {e}")
+
+    with st.expander("Methodology"):
+        st.markdown("""
+This query tracks daily **new accounts** across both **Cadence** and **EVM**, counting only the **first appearance** of each unique account/address.  
+
+- **Daily New Accounts**: first-time actors/addresses per day  
+- **Cumulative Account Growth**: running total over time  
+
+This highlights daily and cumulative growth trends across **Flow Cadence** and **Flow EVM**.
+        """)
     render_footer()
 
 with tabs[3]:
     st.subheader("New / Active / Total Accounts")
-    st.info("Coming next: combined view with time alignment and cumulative totals.")
+    CADENCE_COLOR = "#4F46E5"  # indigo
+    EVM_COLOR     = "#22C55E"  # green
+    TOTAL_COLOR   = "#0EA5E9"  # cyan
+    NEUTRAL_LINE  = "#64748B"  # slate
+    c1, c2, c3 = st.columns(3)
+    try:
+        n_active = qp(SQL_NAT_ACTIVE_NUMBER)
+        c1.metric("Active Accounts — EVM + Cadence", f"{int(n_active.iloc[0,0]):,}")
+    except Exception: c1.info("—")
+
+    try:
+        n_new = qp(SQL_NAT_NEW_NUMBER)
+        c2.metric("Accounts Created — EVM + Cadence", f"{int(n_new.iloc[0,0]):,}")
+    except Exception: c2.info("—")
+
+    try:
+        n_total = q(SQL_NAT_TOTAL_NUMBER)  # no {{Period}} here
+        c3.metric("Total Accounts — EVM + Cadence (all-time)", f"{int(n_total.iloc[0,0]):,}")
+    except Exception: c3.info("—")
+
+    # Combined chart: New vs Active vs Total (bars + lines)
+    try:
+        df = qp(SQL_NAT_TIMESERIES).copy()
+        df["DATE"] = pd.to_datetime(df["DATE"])
+        for col in ["ACTIVE_USERS","ROLLING_AVG_ACTIVE_USERS","NEW_ACCOUNTS","ROLLING_AVG_NEW_ACCOUNTS","TOTAL_NEW_ACCOUNTS"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        import altair as alt
+        bars_new = alt.Chart(df).mark_bar(color=EVM_COLOR, opacity=0.8).encode(
+            x=alt.X("DATE:T", title="Date"),
+            y=alt.Y("NEW_ACCOUNTS:Q", title="New / Active / Total Accounts"),
+            tooltip=["DATE:T","NEW_ACCOUNTS:Q"]
+        ).properties(height=340)
+
+        line_active = alt.Chart(df).mark_line(color=CADENCE_COLOR, strokeWidth=2).encode(
+            x="DATE:T", y="ACTIVE_USERS:Q", tooltip=["DATE:T","ACTIVE_USERS:Q"]
+        )
+
+        line_total = alt.Chart(df).mark_line(color=TOTAL_COLOR, strokeWidth=2).encode(
+            x="DATE:T", y="TOTAL_NEW_ACCOUNTS:Q", tooltip=["DATE:T","TOTAL_NEW_ACCOUNTS:Q"]
+        )
+
+        roll_new = alt.Chart(df.dropna(subset=["ROLLING_AVG_NEW_ACCOUNTS"])).mark_line(
+            strokeDash=[6,4], color=NEUTRAL_LINE, strokeWidth=2
+        ).encode(x="DATE:T", y="ROLLING_AVG_NEW_ACCOUNTS:Q")
+
+        st.altair_chart(bars_new + line_active + line_total + roll_new, use_container_width=True)
+    except Exception as e:
+        st.warning(f"Could not render combined chart: {e}")
+
+    with st.expander("Methodology"):
+        st.markdown("""
+This combines **new** and **active** account views across **Cadence** and **EVM**.
+
+**Daily New Accounts**  
+First appearance of each unique account or address across both environments.  
+- *daily_new_accounts*: first-time users per day  
+- *total_new_accounts*: cumulative new users over time
+
+**Daily Active Accounts**  
+Unique accounts transacting on a given day (regardless of first seen date).  
+- *daily_active_accounts*: engagement per day
+
+Together, these show acquisition (new), engagement (active), and long-term adoption (total).
+        """)
     render_footer()
 
 with tabs[4]:
     st.subheader("Fees")
+    CADENCE_COLOR = "#4F46E5"  # indigo
+    EVM_COLOR     = "#22C55E"  # green
+    TOTAL_COLOR   = "#0EA5E9"  # cyan
+    NEUTRAL_LINE  = "#64748B"  # slate
     st.info("Coming next: average / total fees (FLOW & USD), success share, and volatility bands.")
     render_footer()
 
 with tabs[5]:
     st.subheader("Supply")
+    CADENCE_COLOR = "#4F46E5"  # indigo
+    EVM_COLOR     = "#22C55E"  # green
+    TOTAL_COLOR   = "#0EA5E9"  # cyan
+    NEUTRAL_LINE  = "#64748B"  # slate
     st.info("Coming next: FLOW supply breakdown & deltas.")
     render_footer()
 
 with tabs[6]:
     st.subheader("Contracts")
+    CADENCE_COLOR = "#4F46E5"  # indigo
+    EVM_COLOR     = "#22C55E"  # green
+    TOTAL_COLOR   = "#0EA5E9"  # cyan
+    NEUTRAL_LINE  = "#64748B"  # slate
     st.info("Coming next: deployments, active contracts, and event activity (period-aware).")
     render_footer()
 
 with tabs[7]:
     st.subheader("Contract Deployers")
+    CADENCE_COLOR = "#4F46E5"  # indigo
+    EVM_COLOR     = "#22C55E"  # green
+    TOTAL_COLOR   = "#0EA5E9"  # cyan
+    NEUTRAL_LINE  = "#64748B"  # slate
     st.info("Coming next: top deployers, velocity, and retention by cohort.")
     render_footer()
