@@ -1718,6 +1718,99 @@ SELECT * FROM final_results
 ORDER BY day DESC
 """
 
+-- SQL_WEEKLY_NEW_CONTRACTS_BY_TYPE
+WITH time_params AS (
+  SELECT
+    /* Start bound honors your Period control */
+    CASE '{{Period}}'
+      WHEN 'all_time'       THEN '2020-01-01'::DATE
+      WHEN 'last_year'      THEN CURRENT_DATE - INTERVAL '1 YEAR'
+      WHEN 'last_3_months'  THEN CURRENT_DATE - INTERVAL '3 MONTHS'
+      WHEN 'last_month'     THEN CURRENT_DATE - INTERVAL '1 MONTH'
+      WHEN 'last_week'      THEN CURRENT_DATE - INTERVAL '1 WEEK'
+      WHEN 'last_24h'       THEN CURRENT_DATE - INTERVAL '1 DAY'
+      ELSE CURRENT_DATE - INTERVAL '1 DAY'
+    END AS start_date,
+    /* Always cut off at the beginning of the current week to avoid partial weekly bars */
+    DATE_TRUNC('week', CURRENT_DATE) AS end_date
+),
+
+/* --- Cadence debuts (true first-ever appearance, no date filter here) --- */
+cadence_debuts AS (
+  SELECT
+    event_contract AS contract,
+    MIN(block_timestamp) AS debut
+  FROM flow.core.fact_events
+  GROUP BY 1
+),
+cadence_weekly AS (
+  SELECT
+    DATE_TRUNC('week', d.debut) AS week,
+    COUNT(*) AS new_cadence_contracts
+  FROM cadence_debuts d, time_params tp
+  WHERE d.debut >= tp.start_date AND d.debut < tp.end_date
+  GROUP BY 1
+),
+
+/* --- EVM: find deployment tx + creator, tag COA vs EOA --- */
+evm_candidates AS (
+  /* via ContractDeployed event (topic) */
+  SELECT
+    x.block_timestamp,
+    x.from_address AS creator,
+    y.contract_address AS contract
+  FROM flow.core_evm.fact_transactions x
+  JOIN flow.core_evm.fact_event_logs y ON x.tx_hash = y.tx_hash
+  WHERE y.topics[0] ILIKE '%0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0%'
+
+  UNION ALL
+
+  /* via init code signature (fallback) */
+  SELECT
+    x.block_timestamp,
+    x.from_address AS creator,
+    x.tx_hash AS contract
+  FROM flow.core_evm.fact_transactions x
+  WHERE x.origin_function_signature IN ('0x60c06040','0x60806040')
+    AND x.tx_hash NOT IN (
+      SELECT x.tx_hash
+      FROM flow.core_evm.fact_transactions x
+      JOIN flow.core_evm.fact_event_logs y ON x.tx_hash = y.tx_hash
+      WHERE y.topics[0] ILIKE '%0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0%'
+    )
+),
+
+/* Debut per EVM contract + COA tag */
+evm_debuts AS (
+  SELECT
+    contract,
+    MIN(block_timestamp) AS debut,
+    /* COA if ANY row for this contract was created by a COA creator */
+    MAX(CASE WHEN creator LIKE '0x0000000000000000000000020000000000000000%' THEN 1 ELSE 0 END) AS is_coa
+  FROM evm_candidates
+  GROUP BY 1
+),
+
+evm_weekly AS (
+  SELECT
+    DATE_TRUNC('week', d.debut) AS week,
+    SUM(CASE WHEN d.is_coa = 1 THEN 1 ELSE 0 END) AS new_evm_coa_contracts,
+    SUM(CASE WHEN d.is_coa = 1 THEN 0 ELSE 1 END) AS new_evm_eoa_contracts
+  FROM evm_debuts d, time_params tp
+  WHERE d.debut >= tp.start_date AND d.debut < tp.end_date
+  GROUP BY 1
+)
+
+/* --- Final weekly table --- */
+SELECT
+  COALESCE(c.week, e.week) AS week,
+  COALESCE(c.new_cadence_contracts, 0)        AS cadence,
+  COALESCE(e.new_evm_coa_contracts, 0)        AS evm_coa,
+  COALESCE(e.new_evm_eoa_contracts, 0)        AS evm_eoa
+FROM cadence_weekly c
+FULL JOIN evm_weekly e ON c.week = e.week
+ORDER BY week ASC;
+
 
 
 
@@ -2268,25 +2361,83 @@ with tabs[6]:
             st.altair_chart((bars + line).properties(height=360, title="Contract (Cadence+EVM) Deployment Over Time"), use_container_width=True)
         else:
             st.info("No contract deployment timeseries.")
-    
-        # ---- 100% stacked area: Cadence vs EVM-COA vs EVM-EOA
-        dtypes = qp(render_sql(SQL_CONTRACTS_DISTRIBUTION_TYPES, period_key))
-        if dtypes is not None and not dtypes.empty:
-            dd = dtypes.copy(); dd.columns = [c.upper() for c in dd.columns]
-            for c in ("CADENCE_NEW","EVM_COA_NEW","EVM_EOA_NEW"):
-                if c in dd.columns: dd[c] = pd.to_numeric(dd[c], errors="coerce")
-            dd = dd.dropna(subset=["DAY"]).sort_values("DAY")
-            long = dd.melt(id_vars=["DAY"], value_vars=["CADENCE_NEW","EVM_COA_NEW","EVM_EOA_NEW"],
-                           var_name="Bucket", value_name="Count")
-            area = alt.Chart(long).mark_area(opacity=0.85).encode(
-                x=alt.X("DAY:T", title="Period"),
-                y=alt.Y("Count:Q", stack="normalize", title="Share of new contracts"),
-                color=alt.Color("Bucket:N", title="Type", sort=["CADENCE_NEW","EVM_COA_NEW","EVM_EOA_NEW"]),
-                tooltip=[alt.Tooltip("DAY:T"), "Bucket:N", alt.Tooltip("Count:Q", format=",.0f")]
-            ).properties(height=360, title="Distribution of new contracts by type (Cadence + COA vs EOA)")
-            st.altair_chart(area, use_container_width=True)
-        else:
-            st.info("No type distribution data.")
+
+        # --- Colors (reuse your app's palette if available) ---
+        try:
+            CADENCE_COLOR = COLORS.get("cadence", "#22c55e")  # green
+            EVM_COA_COLOR = COLORS.get("evm_coa", "#0ea5e9")  # sky
+            EVM_EOA_COLOR = COLORS.get("evm_eoa", "#8b5cf6")  # violet
+        except Exception:
+            CADENCE_COLOR = "#22c55e"
+            EVM_COA_COLOR = "#0ea5e9"
+            EVM_EOA_COLOR = "#8b5cf6"
+        
+        # --- Query the weekly-by-type data ---
+        try:
+            weekly_df = qp(render_sql(SQL_WEEKLY_NEW_CONTRACTS_BY_TYPE, PERIOD_KEY))
+        except Exception as e:
+            weekly_df = None
+            st.error(f"Failed to load weekly new-contracts-by-type: {e}")
+        
+        # --- Two columns: left=new weekly by type, right=your existing distribution chart ---
+        left, right = st.columns(2, gap="large")
+
+        with left:
+            st.subheader("Weekly New Contracts by Type")
+            if weekly_df is None or weekly_df.empty:
+                st.info("No weekly data available for the selected period.")
+            else:
+                import altair as alt
+                # long-form for grouped bars
+                weekly_chart = (
+                    alt.Chart(weekly_df)
+                    .transform_fold(
+                        ["cadence", "evm_coa", "evm_eoa"],
+                        as_=["Type", "New Contracts"]
+                    )
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("week:T", title="Week"),
+                        y=alt.Y("New Contracts:Q", title="New Contracts"),
+                        color=alt.Color(
+                            "Type:N",
+                            scale=alt.Scale(
+                                domain=["cadence", "evm_coa", "evm_eoa"],
+                                range=[CADENCE_COLOR, EVM_COA_COLOR, EVM_EOA_COLOR],
+                            ),
+                            legend=alt.Legend(title="Type", orient="top"),
+                        ),
+                        xOffset="Type:N",
+                        tooltip=[
+                            alt.Tooltip("week:T", title="Week"),
+                            alt.Tooltip("Type:N"),
+                            alt.Tooltip("New Contracts:Q", format=","),
+                        ],
+                    )
+                    .properties(height=320)
+                )
+                st.altair_chart(weekly_chart, use_container_width=True)
+        
+        with right:
+            # ---- 100% stacked area: Cadence vs EVM-COA vs EVM-EOA
+            dtypes = qp(render_sql(SQL_CONTRACTS_DISTRIBUTION_TYPES, period_key))
+            if dtypes is not None and not dtypes.empty:
+                dd = dtypes.copy(); dd.columns = [c.upper() for c in dd.columns]
+                for c in ("CADENCE_NEW","EVM_COA_NEW","EVM_EOA_NEW"):
+                    if c in dd.columns: dd[c] = pd.to_numeric(dd[c], errors="coerce")
+                dd = dd.dropna(subset=["DAY"]).sort_values("DAY")
+                long = dd.melt(id_vars=["DAY"], value_vars=["CADENCE_NEW","EVM_COA_NEW","EVM_EOA_NEW"],
+                               var_name="Bucket", value_name="Count")
+                area = alt.Chart(long).mark_area(opacity=0.85).encode(
+                    x=alt.X("DAY:T", title="Period"),
+                    y=alt.Y("Count:Q", stack="normalize", title="Share of new contracts"),
+                    color=alt.Color("Bucket:N", title="Type", sort=["CADENCE_NEW","EVM_COA_NEW","EVM_EOA_NEW"]),
+                    tooltip=[alt.Tooltip("DAY:T"), "Bucket:N", alt.Tooltip("Count:Q", format=",.0f")]
+                ).properties(height=360, title="Distribution of new contracts by type (Cadence + COA vs EOA)")
+                st.altair_chart(area, use_container_width=True)
+            else:
+                st.info("No type distribution data.")
+            pass
     
         # ---- Cadence vs EVM distribution (different look): normalized stacked bars + pie
         dist = qp(render_sql(SQL_CONTRACTS_CHAIN_DISTRIBUTION, period_key))
