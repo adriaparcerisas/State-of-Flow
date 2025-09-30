@@ -1307,6 +1307,442 @@ FROM supply_breakdown
 ORDER BY date DESC
 """
 
+# =========================
+# CONTRACTS — SQL
+# =========================
+
+SQL_CONTRACTS_KPIS = """
+WITH time_periods AS (
+    SELECT
+        CASE '{{Period}}'
+            WHEN 'all_time' THEN '2020-01-01'::DATE
+            WHEN 'last_year' THEN CURRENT_DATE - INTERVAL '1 YEAR'
+            WHEN 'last_3_months' THEN CURRENT_DATE - INTERVAL '3 MONTHS'
+            WHEN 'last_month' THEN CURRENT_DATE - INTERVAL '1 MONTH'
+            WHEN 'last_week' THEN CURRENT_DATE - INTERVAL '1 WEEK'
+            ELSE CURRENT_DATE - INTERVAL '1 DAY'
+        END AS start_date
+),
+cadence AS (
+  SELECT DISTINCT event_contract AS contract, MIN(block_timestamp) AS debut
+  FROM flow.core.fact_events
+  JOIN time_periods tp
+    ON block_timestamp >= tp.start_date
+  GROUP BY 1
+),
+core_new_contracts AS (
+  SELECT COUNT(DISTINCT contract) AS total_new_cadence_contracts FROM cadence
+),
+evms AS (
+  SELECT x.block_timestamp, x.from_address AS creator, y.contract_address AS contract
+  FROM flow.core_evm.fact_transactions x
+  JOIN flow.core_evm.fact_event_logs y ON x.tx_hash = y.tx_hash
+  JOIN time_periods tp ON x.block_timestamp >= tp.start_date
+  WHERE y.topics[0] ILIKE '%0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0%'
+  UNION
+  SELECT x.block_timestamp, x.from_address AS creator, x.tx_hash AS contract
+  FROM flow.core_evm.fact_transactions x
+  JOIN time_periods tp ON x.block_timestamp >= tp.start_date
+  WHERE x.origin_function_signature IN ('0x60c06040','0x60806040')
+    AND x.tx_hash NOT IN (
+      SELECT x.tx_hash
+      FROM flow.core_evm.fact_transactions x
+      JOIN flow.core_evm.fact_event_logs y ON x.tx_hash = y.tx_hash
+      WHERE y.topics[0] ILIKE '%0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0%'
+    )
+),
+evm_new_contracts AS (
+  SELECT COUNT(DISTINCT contract) AS total_new_evm_contracts FROM evms
+)
+SELECT
+  (SELECT total_new_cadence_contracts FROM core_new_contracts) AS total_new_cadence_contracts,
+  (SELECT total_new_evm_contracts     FROM evm_new_contracts) AS total_new_evm_contracts
+"""
+
+SQL_CONTRACTS_TIMESERIES = """
+WITH 
+cadence AS (
+    SELECT 
+        CASE '{{Period}}'
+            WHEN 'all_time' THEN DATE_TRUNC('month', block_timestamp)
+            WHEN 'last_year' THEN DATE_TRUNC('week', block_timestamp)
+            WHEN 'last_3_months' THEN DATE_TRUNC('week', block_timestamp)
+            WHEN 'last_month' THEN DATE_TRUNC('day', block_timestamp)
+            WHEN 'last_week' THEN DATE_TRUNC('day', block_timestamp)
+            WHEN 'last_24h' THEN DATE_TRUNC('hour', block_timestamp)
+        END AS time_stamp,
+        COUNT(DISTINCT event_contract) AS total_new_cadence_contracts
+    FROM flow.core.fact_events
+    WHERE block_timestamp >= CASE '{{Period}}'
+            WHEN 'all_time' THEN '2020-01-01'::DATE
+            WHEN 'last_year' THEN CURRENT_DATE - INTERVAL '1 YEAR'
+            WHEN 'last_3_months' THEN CURRENT_DATE - INTERVAL '3 MONTHS'
+            WHEN 'last_month' THEN CURRENT_DATE - INTERVAL '1 MONTH'
+            WHEN 'last_week' THEN CURRENT_DATE - INTERVAL '1 WEEK'
+            WHEN 'last_24h' THEN CURRENT_DATE - INTERVAL '1 DAY'
+        END
+    GROUP BY 1
+),
+evms AS (
+    SELECT 
+        CASE '{{Period}}'
+            WHEN 'all_time' THEN DATE_TRUNC('month', x.block_timestamp)
+            WHEN 'last_year' THEN DATE_TRUNC('week', x.block_timestamp)
+            WHEN 'last_3_months' THEN DATE_TRUNC('week', x.block_timestamp)
+            WHEN 'last_month' THEN DATE_TRUNC('day', x.block_timestamp)
+            WHEN 'last_week' THEN DATE_TRUNC('day', x.block_timestamp)
+            WHEN 'last_24h' THEN DATE_TRUNC('hour', x.block_timestamp)
+        END AS time_stamp,
+        COUNT(DISTINCT CASE 
+            WHEN y.topics[0] ILIKE '%0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0%'
+                 THEN y.contract_address 
+            ELSE x.tx_hash 
+        END) AS total_new_evm_contracts
+    FROM flow.core_evm.fact_transactions x
+    LEFT JOIN flow.core_evm.fact_event_logs y ON x.tx_hash = y.tx_hash 
+    WHERE (y.topics[0] ILIKE '%0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0%'
+        OR x.origin_function_signature IN ('0x60c06040','0x60806040'))
+      AND x.block_timestamp >= CASE '{{Period}}'
+            WHEN 'all_time' THEN '2020-01-01'::DATE
+            WHEN 'last_year' THEN CURRENT_DATE - INTERVAL '1 YEAR'
+            WHEN 'last_3_months' THEN CURRENT_DATE - INTERVAL '3 MONTHS'
+            WHEN 'last_month' THEN CURRENT_DATE - INTERVAL '1 MONTH'
+            WHEN 'last_week' THEN CURRENT_DATE - INTERVAL '1 WEEK'
+            WHEN 'last_24h' THEN CURRENT_DATE - INTERVAL '1 DAY'
+        END
+    GROUP BY 1
+)
+SELECT
+    COALESCE(c.time_stamp, e.time_stamp) AS day,
+    COALESCE(c.total_new_cadence_contracts, 0) AS new_cadence_contracts,
+    SUM(COALESCE(c.total_new_cadence_contracts, 0)) OVER (ORDER BY COALESCE(c.time_stamp, e.time_stamp)) AS total_cadence_contracts,
+    COALESCE(e.total_new_evm_contracts, 0) AS new_evm_contracts,
+    SUM(COALESCE(e.total_new_evm_contracts, 0)) OVER (ORDER BY COALESCE(c.time_stamp, e.time_stamp)) AS total_evm_contracts,
+    COALESCE(c.total_new_cadence_contracts, 0) + COALESCE(e.total_new_evm_contracts, 0) AS full_contracts,
+    SUM(COALESCE(c.total_new_cadence_contracts, 0) + COALESCE(e.total_new_evm_contracts, 0)) 
+        OVER (ORDER BY COALESCE(c.time_stamp, e.time_stamp)) AS total_full_contracts,
+    AVG(COALESCE(c.total_new_cadence_contracts, 0) + COALESCE(e.total_new_evm_contracts, 0)) 
+        OVER (ORDER BY COALESCE(c.time_stamp, e.time_stamp) ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS rolling_avg_new_contracts
+FROM cadence c
+FULL JOIN evms e ON c.time_stamp = e.time_stamp
+WHERE COALESCE(c.time_stamp, e.time_stamp) < CASE '{{Period}}'
+        WHEN 'all_time' THEN DATE_TRUNC('month', current_date)
+        WHEN 'last_year' THEN DATE_TRUNC('week', current_date)
+        WHEN 'last_3_months' THEN DATE_TRUNC('week', current_date)
+        WHEN 'last_month' THEN DATE_TRUNC('day', current_date)
+        WHEN 'last_week' THEN DATE_TRUNC('day', current_date)
+        WHEN 'last_24h' THEN DATE_TRUNC('hour', current_date)
+    END
+ORDER BY 1 DESC
+"""
+
+# Cadence vs COA vs EOA distribution (100% stacked area)
+SQL_CONTRACTS_DISTRIBUTION_TYPES = """
+WITH time_params AS (
+    SELECT
+        CASE '{{Period}}'
+            WHEN 'all_time' THEN '2020-01-01'::DATE
+            WHEN 'last_year' THEN CURRENT_DATE - INTERVAL '1 YEAR'
+            WHEN 'last_3_months' THEN CURRENT_DATE - INTERVAL '3 MONTHS'
+            WHEN 'last_month' THEN CURRENT_DATE - INTERVAL '1 MONTH'
+            WHEN 'last_week' THEN CURRENT_DATE - INTERVAL '1 WEEK'
+            WHEN 'last_24h' THEN CURRENT_DATE - INTERVAL '1 DAY'
+        END AS start_date,
+        CASE '{{Period}}'
+            WHEN 'all_time' THEN DATE_TRUNC('month', current_date)
+            WHEN 'last_year' THEN DATE_TRUNC('week', current_date)
+            WHEN 'last_3_months' THEN DATE_TRUNC('week', current_date)
+            WHEN 'last_month' THEN DATE_TRUNC('day', current_date)
+            WHEN 'last_week' THEN DATE_TRUNC('day', current_date)
+            WHEN 'last_24h' THEN DATE_TRUNC('hour', current_date)
+        END AS end_date
+),
+cadence AS (
+    SELECT DISTINCT event_contract AS contract, MIN(block_timestamp) AS debut
+    FROM flow.core.fact_events
+    WHERE block_timestamp >= (SELECT start_date FROM time_params)
+      AND block_timestamp <  (SELECT end_date   FROM time_params)
+    GROUP BY 1
+),
+core_new_contracts AS (
+    SELECT
+        CASE '{{Period}}'
+            WHEN 'all_time' THEN DATE_TRUNC('month', debut)
+            WHEN 'last_year' THEN DATE_TRUNC('week', debut)
+            WHEN 'last_3_months' THEN DATE_TRUNC('week', debut)
+            WHEN 'last_month' THEN DATE_TRUNC('day', debut)
+            WHEN 'last_week' THEN DATE_TRUNC('day', debut)
+            WHEN 'last_24h' THEN DATE_TRUNC('hour', debut)
+        END AS day,
+        COUNT(DISTINCT contract) AS cadence_new
+    FROM cadence
+    GROUP BY 1
+),
+evms AS (
+    SELECT x.block_timestamp, x.from_address AS creator, y.contract_address AS contract 
+    FROM flow.core_evm.fact_transactions x
+    JOIN flow.core_evm.fact_event_logs y ON x.tx_hash = y.tx_hash
+    WHERE y.topics[0] ILIKE '%0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0%'
+      AND x.block_timestamp >= (SELECT start_date FROM time_params)
+      AND x.block_timestamp <  (SELECT end_date   FROM time_params)
+    UNION
+    SELECT x.block_timestamp, x.from_address AS creator, x.tx_hash AS contract 
+    FROM flow.core_evm.fact_transactions x
+    WHERE x.origin_function_signature IN ('0x60c06040','0x60806040')
+      AND x.block_timestamp >= (SELECT start_date FROM time_params)
+      AND x.block_timestamp <  (SELECT end_date   FROM time_params)
+      AND x.tx_hash NOT IN (
+        SELECT x.tx_hash
+        FROM flow.core_evm.fact_transactions x
+        JOIN flow.core_evm.fact_event_logs y ON x.tx_hash = y.tx_hash
+        WHERE y.topics[0] ILIKE '%0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0%'
+      )
+),
+evm_new_contracts AS (
+    SELECT 
+        CASE '{{Period}}'
+            WHEN 'all_time' THEN DATE_TRUNC('month', block_timestamp)
+            WHEN 'last_year' THEN DATE_TRUNC('week', block_timestamp)
+            WHEN 'last_3_months' THEN DATE_TRUNC('week', block_timestamp)
+            WHEN 'last_month' THEN DATE_TRUNC('day', block_timestamp)
+            WHEN 'last_week' THEN DATE_TRUNC('day', block_timestamp)
+            WHEN 'last_24h' THEN DATE_TRUNC('hour', block_timestamp)
+        END AS day,
+        COUNT(DISTINCT CASE WHEN creator LIKE '0x0000000000000000000000020000000000000000%' THEN contract END) AS evm_coa_new,
+        COUNT(DISTINCT CASE WHEN creator NOT LIKE '0x0000000000000000000000020000000000000000%' THEN contract END) AS evm_eoa_new
+    FROM evms
+    GROUP BY 1
+)
+SELECT
+    COALESCE(c.day, e.day) AS day,
+    COALESCE(c.cadence_new, 0) AS cadence_new,
+    COALESCE(e.evm_coa_new, 0) AS evm_coa_new,
+    COALESCE(e.evm_eoa_new, 0) AS evm_eoa_new
+FROM core_new_contracts c
+FULL JOIN evm_new_contracts e ON c.day = e.day
+ORDER BY day DESC
+"""
+
+# Cadence vs EVM distribution (different style from previous)
+SQL_CONTRACTS_CHAIN_DISTRIBUTION = """
+WITH 
+cadence AS (
+    SELECT 
+        DISTINCT event_contract AS contract,
+        CASE '{{Period}}'
+            WHEN 'all_time' THEN DATE_TRUNC('month', block_timestamp)
+            WHEN 'last_year' THEN DATE_TRUNC('week', block_timestamp)
+            WHEN 'last_3_months' THEN DATE_TRUNC('week', block_timestamp)
+            WHEN 'last_month' THEN DATE_TRUNC('day', block_timestamp)
+            WHEN 'last_week' THEN DATE_TRUNC('day', block_timestamp)
+            WHEN 'last_24h' THEN DATE_TRUNC('hour', block_timestamp)
+        END AS time_stamp
+    FROM flow.core.fact_events
+    WHERE block_timestamp >= CASE '{{Period}}'
+            WHEN 'all_time' THEN '2020-01-01'::DATE
+            WHEN 'last_year' THEN CURRENT_DATE - INTERVAL '1 YEAR'
+            WHEN 'last_3_months' THEN CURRENT_DATE - INTERVAL '3 MONTHS'
+            WHEN 'last_month' THEN CURRENT_DATE - INTERVAL '1 MONTH'
+            WHEN 'last_week' THEN CURRENT_DATE - INTERVAL '1 WEEK'
+            WHEN 'last_24h' THEN CURRENT_DATE - INTERVAL '1 DAY'
+        END
+),
+core_new_contracts AS (
+    SELECT time_stamp AS day, 'Cadence' AS type, COUNT(DISTINCT contract) AS new_contracts
+    FROM cadence
+    GROUP BY 1,2
+),
+evms AS (
+    SELECT 
+        CASE '{{Period}}'
+            WHEN 'all_time' THEN DATE_TRUNC('month', x.block_timestamp)
+            WHEN 'last_year' THEN DATE_TRUNC('week', x.block_timestamp)
+            WHEN 'last_3_months' THEN DATE_TRUNC('week', x.block_timestamp)
+            WHEN 'last_month' THEN DATE_TRUNC('day', x.block_timestamp)
+            WHEN 'last_week' THEN DATE_TRUNC('day', x.block_timestamp)
+            WHEN 'last_24h' THEN DATE_TRUNC('hour', x.block_timestamp)
+        END AS time_stamp,
+        x.tx_hash AS contract
+    FROM flow.core_evm.fact_transactions x
+    LEFT JOIN flow.core_evm.fact_event_logs y ON x.tx_hash = y.tx_hash 
+    WHERE (y.topics[0] ILIKE '%0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0%'
+        OR x.origin_function_signature IN ('0x60c06040','0x60806040'))
+      AND x.block_timestamp >= CASE '{{Period}}'
+            WHEN 'all_time' THEN '2020-01-01'::DATE
+            WHEN 'last_year' THEN CURRENT_DATE - INTERVAL '1 YEAR'
+            WHEN 'last_3_months' THEN CURRENT_DATE - INTERVAL '3 MONTHS'
+            WHEN 'last_month' THEN CURRENT_DATE - INTERVAL '1 MONTH'
+            WHEN 'last_week' THEN CURRENT_DATE - INTERVAL '1 WEEK'
+            WHEN 'last_24h' THEN CURRENT_DATE - INTERVAL '1 DAY'
+        END
+),
+evm_new_contracts AS (
+    SELECT time_stamp AS day, 'EVM' AS type, COUNT(DISTINCT contract) AS new_contracts
+    FROM evms
+    GROUP BY 1,2
+),
+info AS (
+    SELECT day, type, new_contracts FROM core_new_contracts
+    UNION ALL
+    SELECT day, type, new_contracts FROM evm_new_contracts
+)
+SELECT * FROM info
+WHERE day < CASE '{{Period}}'
+        WHEN 'all_time' THEN DATE_TRUNC('month', current_date)
+        WHEN 'last_year' THEN DATE_TRUNC('week', current_date)
+        WHEN 'last_3_months' THEN DATE_TRUNC('week', current_date)
+        WHEN 'last_month' THEN DATE_TRUNC('day', current_date)
+        WHEN 'last_week' THEN DATE_TRUNC('day', current_date)
+        WHEN 'last_24h' THEN DATE_TRUNC('hour', current_date)
+    END
+ORDER BY day DESC
+"""
+
+# =========================
+# CONTRACT DEPLOYERS — SQL
+# =========================
+
+SQL_DEPLOYERS_CADENCE_KPI = """
+WITH time_periods AS (
+    SELECT
+        CASE '{{Period}}'
+            WHEN 'all_time' THEN '2020-01-01'::DATE
+            WHEN 'last_year' THEN CURRENT_DATE - INTERVAL '1 YEAR'
+            WHEN 'last_3_months' THEN CURRENT_DATE - INTERVAL '3 MONTHS'
+            WHEN 'last_month' THEN CURRENT_DATE - INTERVAL '1 MONTH'
+            WHEN 'last_week' THEN CURRENT_DATE - INTERVAL '1 WEEK'
+            ELSE CURRENT_DATE - INTERVAL '1 DAY'
+        END AS start_date
+),
+cadence AS (
+    SELECT DISTINCT authorizers[0] AS users, MIN(TRUNC(x.block_timestamp, 'week')) AS debut
+    FROM flow.core.fact_events AS x
+    JOIN flow.core.fact_transactions y ON x.tx_id = y.tx_id
+    JOIN time_periods tp ON x.block_timestamp >= tp.start_date
+    WHERE x.event_type = 'AccountContractAdded'
+    GROUP BY 1
+)
+SELECT COUNT(DISTINCT users) AS total_cadence_deployers FROM cadence
+"""
+
+SQL_DEPLOYERS_TIMESERIES = """
+WITH 
+cadence AS (
+    SELECT DISTINCT authorizers[0] AS users, 
+        CASE '{{Period}}'
+            WHEN 'all_time' THEN DATE_TRUNC('month', x.block_timestamp)
+            WHEN 'last_year' THEN DATE_TRUNC('week', x.block_timestamp)
+            WHEN 'last_3_months' THEN DATE_TRUNC('week', x.block_timestamp)
+            WHEN 'last_month' THEN DATE_TRUNC('day', x.block_timestamp)
+            WHEN 'last_week' THEN DATE_TRUNC('day', x.block_timestamp)
+            WHEN 'last_24h' THEN DATE_TRUNC('hour', x.block_timestamp)
+        END AS debut
+    FROM flow.core.fact_events x
+    JOIN flow.core.fact_transactions y ON x.tx_id = y.tx_id
+    WHERE x.event_type = 'AccountContractAdded'
+      AND x.block_timestamp >= CASE '{{Period}}'
+            WHEN 'all_time' THEN '2020-01-01'::DATE
+            WHEN 'last_year' THEN CURRENT_DATE - INTERVAL '1 YEAR'
+            WHEN 'last_3_months' THEN CURRENT_DATE - INTERVAL '3 MONTHS'
+            WHEN 'last_month' THEN CURRENT_DATE - INTERVAL '1 MONTH'
+            WHEN 'last_week' THEN CURRENT_DATE - INTERVAL '1 WEEK'
+            WHEN 'last_24h' THEN CURRENT_DATE - INTERVAL '1 DAY'
+        END
+),
+core_new_deployers AS (
+    SELECT debut AS date, COUNT(DISTINCT users) AS new_cadence_deployers
+    FROM cadence
+    GROUP BY 1
+),
+evms AS (
+    SELECT 
+        CASE '{{Period}}'
+            WHEN 'all_time' THEN DATE_TRUNC('month', x.block_timestamp)
+            WHEN 'last_year' THEN DATE_TRUNC('week', x.block_timestamp)
+            WHEN 'last_3_months' THEN DATE_TRUNC('week', x.block_timestamp)
+            WHEN 'last_month' THEN DATE_TRUNC('day', x.block_timestamp)
+            WHEN 'last_week' THEN DATE_TRUNC('day', x.block_timestamp)
+            WHEN 'last_24h' THEN DATE_TRUNC('hour', x.block_timestamp)
+        END AS block_timestamp,
+        x.from_address AS creator,
+        y.contract_address AS contract 
+    FROM flow.core_evm.fact_transactions x
+    JOIN flow.core_evm.fact_event_logs y ON x.tx_hash = y.tx_hash
+    WHERE y.topics[0] ILIKE '%0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0%'
+      AND x.block_timestamp >= CASE '{{Period}}'
+            WHEN 'all_time' THEN '2020-01-01'::DATE
+            WHEN 'last_year' THEN CURRENT_DATE - INTERVAL '1 YEAR'
+            WHEN 'last_3_months' THEN CURRENT_DATE - INTERVAL '3 MONTHS'
+            WHEN 'last_month' THEN CURRENT_DATE - INTERVAL '1 MONTH'
+            WHEN 'last_week' THEN CURRENT_DATE - INTERVAL '1 WEEK'
+            WHEN 'last_24h' THEN CURRENT_DATE - INTERVAL '1 DAY'
+        END
+    UNION
+    SELECT 
+        CASE '{{Period}}'
+            WHEN 'all_time' THEN DATE_TRUNC('month', x.block_timestamp)
+            WHEN 'last_year' THEN DATE_TRUNC('week', x.block_timestamp)
+            WHEN 'last_3_months' THEN DATE_TRUNC('week', x.block_timestamp)
+            WHEN 'last_month' THEN DATE_TRUNC('day', x.block_timestamp)
+            WHEN 'last_week' THEN DATE_TRUNC('day', x.block_timestamp)
+            WHEN 'last_24h' THEN DATE_TRUNC('hour', x.block_timestamp)
+        END AS block_timestamp,
+        x.from_address AS creator, 
+        x.tx_hash AS contract 
+    FROM flow.core_evm.fact_transactions x
+    WHERE x.origin_function_signature IN ('0x60c06040','0x60806040')
+      AND x.block_timestamp >= CASE '{{Period}}'
+            WHEN 'all_time' THEN '2020-01-01'::DATE
+            WHEN 'last_year' THEN CURRENT_DATE - INTERVAL '1 YEAR'
+            WHEN 'last_3_months' THEN CURRENT_DATE - INTERVAL '3 MONTHS'
+            WHEN 'last_month' THEN CURRENT_DATE - INTERVAL '1 MONTH'
+            WHEN 'last_week' THEN CURRENT_DATE - INTERVAL '1 WEEK'
+            WHEN 'last_24h' THEN CURRENT_DATE - INTERVAL '1 DAY'
+        END
+      AND x.tx_hash NOT IN (
+        SELECT x.tx_hash
+        FROM flow.core_evm.fact_transactions x
+        JOIN flow.core_evm.fact_event_logs y ON x.tx_hash = y.tx_hash
+        WHERE y.topics[0] ILIKE '%0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0%'
+      )
+),
+evms2 AS (
+    SELECT DISTINCT creator AS users, block_timestamp AS debut FROM evms
+),
+evm_new_deployers AS (
+    SELECT debut AS date, COUNT(DISTINCT users) AS new_evm_deployers
+    FROM evms2
+    GROUP BY 1
+),
+final_results AS (
+    SELECT
+        COALESCE(x.date, y.date) AS day,
+        COALESCE(new_cadence_deployers, 0) AS new_cadence_deployerss,
+        SUM(COALESCE(new_cadence_deployers, 0)) OVER (ORDER BY COALESCE(x.date, y.date)) AS total_cadence_deployers,
+        COALESCE(new_evm_deployers, 0) AS new_evm_deployerss,
+        SUM(COALESCE(new_evm_deployers, 0)) OVER (ORDER BY COALESCE(x.date, y.date)) AS total_evm_deployers,
+        COALESCE(new_cadence_deployers, 0) + COALESCE(new_evm_deployers, 0) AS full_deployers,
+        SUM(COALESCE(new_cadence_deployers, 0) + COALESCE(new_evm_deployers, 0)) OVER (ORDER BY COALESCE(x.date, y.date)) AS total_full_deployers,
+        AVG(COALESCE(new_cadence_deployers, 0) + COALESCE(new_evm_deployers, 0)) OVER (
+            ORDER BY COALESCE(x.date, y.date)
+            ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
+        ) AS rolling_avg_full_deployers
+    FROM core_new_deployers x 
+    FULL JOIN evm_new_deployers y ON x.date = y.date
+    WHERE COALESCE(x.date, y.date) < CASE '{{Period}}'
+            WHEN 'all_time' THEN DATE_TRUNC('month', current_date)
+            WHEN 'last_year' THEN DATE_TRUNC('week', current_date)
+            WHEN 'last_3_months' THEN DATE_TRUNC('week', current_date)
+            WHEN 'last_month' THEN DATE_TRUNC('day', current_date)
+            WHEN 'last_week' THEN DATE_TRUNC('day', current_date)
+            WHEN 'last_24h' THEN DATE_TRUNC('hour', current_date)
+        END
+)
+SELECT * FROM final_results
+ORDER BY day DESC
+"""
+
+
 
 
 
@@ -1676,12 +2112,11 @@ with tabs[4]:
     st.subheader("Fees")
     CADENCE_COLOR = "#4F46E5"  # indigo
     EVM_COLOR     = "#22C55E"  # green
-    TOTAL_COLOR   = "#0EA5E9"  # cyan
-    NEUTRAL_LINE  = "#64748B"  # slate
+    LINE_COLOR    = "#111827"   # dark gray (for rolling avg / lines)
+    BAR_COLOR     = "#a3a3a3"   # neutral bars
 
     def render_fees_tab():
         period_key = st.session_state.get("period_key", "last_3_months")
-        st.markdown("### 🟢 Fees")
     
         # === KPI ===
         k = qp(render_sql(SQL_FEES_SUMMARY, period_key))
@@ -1742,11 +2177,11 @@ with tabs[5]:
     st.subheader("Supply")
     CADENCE_COLOR = "#4F46E5"  # indigo
     EVM_COLOR     = "#22C55E"  # green
-    TOTAL_COLOR   = "#0EA5E9"  # cyan
-    NEUTRAL_LINE  = "#64748B"  # slate
+    LINE_COLOR    = "#111827"   # dark gray (for rolling avg / lines)
+    BAR_COLOR     = "#a3a3a3"   # neutral bars
+    
     def render_supply_tab():
         period_key = st.session_state.get("period_key", "last_3_months")
-        st.markdown("### 🟢 Supply")
     
         # === Latest snapshot KPIs ===
         snap = qp(SQL_SUPPLY_LATEST)  # no period switch; uses latest available < current week
@@ -1819,7 +2254,106 @@ with tabs[6]:
     EVM_COLOR     = "#22C55E"  # green
     TOTAL_COLOR   = "#0EA5E9"  # cyan
     NEUTRAL_LINE  = "#64748B"  # slate
-    st.info("Coming next: deployments, active contracts, and event activity (period-aware).")
+    LINE_COLOR    = "#111827"   # dark gray (for rolling avg / lines)
+    BAR_COLOR     = "#a3a3a3"   # neutral bars
+    
+    def render_contracts_tab():
+        period_key = st.session_state.get("period_key", "last_3_months")
+    
+        # ---- KPIs
+        k = qp(render_sql(SQL_CONTRACTS_KPIS, period_key))
+        if k is None or k.empty:
+            st.info("No contract KPI data for this period.")
+        else:
+            kk = k.copy(); kk.columns = [c.upper() for c in kk.columns]
+            c_cad = pd.to_numeric(kk.iloc[0].get("TOTAL_NEW_CADENCE_CONTRACTS"), errors="coerce")
+            c_evm = pd.to_numeric(kk.iloc[0].get("TOTAL_NEW_EVM_CONTRACTS"),     errors="coerce")
+            col1, col2 = st.columns(2)
+            with col1: st.metric("Verified Contracts (Cadence)", f"{int(c_cad):,}" if pd.notna(c_cad) else "—")
+            with col2: st.metric("Verified Contracts (EVM)",     f"{int(c_evm):,}" if pd.notna(c_evm) else "—")
+    
+        # ---- New deployments (bars) + rolling average (line)
+        ts = qp(render_sql(SQL_CONTRACTS_TIMESERIES, period_key))
+        if ts is not None and not ts.empty:
+            df = ts.copy(); df.columns = [c.upper() for c in df.columns]
+            for c in ("FULL_CONTRACTS","ROLLING_AVG_NEW_CONTRACTS"):
+                if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
+            df = df.dropna(subset=["DAY"]).sort_values("DAY")
+            bars = alt.Chart(df).mark_bar(opacity=0.7, color=BAR_COLOR).encode(
+                x=alt.X("DAY:T", title="Period"),
+                y=alt.Y("FULL_CONTRACTS:Q", title="New contracts"),
+                tooltip=[alt.Tooltip("DAY:T"), alt.Tooltip("FULL_CONTRACTS:Q", format=",.0f")]
+            )
+            line = alt.Chart(df).mark_line(size=2, color=LINE_COLOR).encode(
+                x="DAY:T",
+                y=alt.Y("ROLLING_AVG_NEW_CONTRACTS:Q", title="Rolling avg (28-period)"),
+                tooltip=[alt.Tooltip("DAY:T"), alt.Tooltip("ROLLING_AVG_NEW_CONTRACTS:Q", format=",.2f")]
+            )
+            st.altair_chart((bars + line).properties(height=360, title="Contract (Cadence+EVM) Deployment Over Time"), use_container_width=True)
+        else:
+            st.info("No contract deployment timeseries.")
+    
+        # ---- 100% stacked area: Cadence vs EVM-COA vs EVM-EOA
+        dtypes = qp(render_sql(SQL_CONTRACTS_DISTRIBUTION_TYPES, period_key))
+        if dtypes is not None and not dtypes.empty:
+            dd = dtypes.copy(); dd.columns = [c.upper() for c in dd.columns]
+            for c in ("CADENCE_NEW","EVM_COA_NEW","EVM_EOA_NEW"):
+                if c in dd.columns: dd[c] = pd.to_numeric(dd[c], errors="coerce")
+            dd = dd.dropna(subset=["DAY"]).sort_values("DAY")
+            long = dd.melt(id_vars=["DAY"], value_vars=["CADENCE_NEW","EVM_COA_NEW","EVM_EOA_NEW"],
+                           var_name="Bucket", value_name="Count")
+            area = alt.Chart(long).mark_area(opacity=0.85).encode(
+                x=alt.X("DAY:T", title="Period"),
+                y=alt.Y("Count:Q", stack="normalize", title="Share of new contracts"),
+                color=alt.Color("Bucket:N", title="Type", sort=["CADENCE_NEW","EVM_COA_NEW","EVM_EOA_NEW"]),
+                tooltip=[alt.Tooltip("DAY:T"), "Bucket:N", alt.Tooltip("Count:Q", format=",.0f")]
+            ).properties(height=360, title="Distribution of new contracts by type (Cadence + COA vs EOA)")
+            st.altair_chart(area, use_container_width=True)
+        else:
+            st.info("No type distribution data.")
+    
+        # ---- Cadence vs EVM distribution (different look): normalized stacked bars + pie
+        dist = qp(render_sql(SQL_CONTRACTS_CHAIN_DISTRIBUTION, period_key))
+        if dist is not None and not dist.empty:
+            d = dist.copy(); d.columns = [c.upper() for c in d.columns]
+            d["NEW_CONTRACTS"] = pd.to_numeric(d["NEW_CONTRACTS"], errors="coerce")
+            d = d.dropna(subset=["DAY"]).sort_values("DAY")
+    
+            colA, colB = st.columns(2)
+            with colA:
+                bar = alt.Chart(d).mark_bar().encode(
+                    x=alt.X("DAY:T", title="Period"),
+                    y=alt.Y("NEW_CONTRACTS:Q", stack="normalize", title="Share"),
+                    color=alt.Color("TYPE:N", scale=alt.Scale(domain=["Cadence","EVM"], range=[CADENCE_COLOR, EVM_COLOR])),
+                    tooltip=[alt.Tooltip("DAY:T"), "TYPE:N", alt.Tooltip("NEW_CONTRACTS:Q", format=",.0f")]
+                ).properties(height=320, title="Evolution of the distribution of new contracts (Cadence vs EVM)")
+                st.altair_chart(bar, use_container_width=True)
+    
+            with colB:
+                pie_df = d.groupby("TYPE", as_index=False)["NEW_CONTRACTS"].sum()
+                pie = alt.Chart(pie_df).mark_arc().encode(
+                    theta=alt.Theta("NEW_CONTRACTS:Q"),
+                    color=alt.Color("TYPE:N", scale=alt.Scale(domain=["Cadence","EVM"], range=[CADENCE_COLOR, EVM_COLOR])),
+                    tooltip=[ "TYPE:N", alt.Tooltip("NEW_CONTRACTS:Q", format=",.0f") ]
+                ).properties(height=320, title="Distribution of contracts deployed: Cadence vs EVM")
+                st.altair_chart(pie, use_container_width=True)
+        else:
+            st.info("No chain distribution data.")
+    
+        # ---- Methodology
+        with st.expander("Methodology"):
+            st.markdown(
+                """
+    This query calculates the daily and cumulative totals of new contracts deployed on both **Flow Cadence** and **Flow EVM**.  
+    It separates Cadence vs EVM (including **COA** vs **EOA** on EVM), shows rolling averages, and compares distributions.
+    
+    - **Daily New Contracts** (per chain and by EVM account type)  
+    - **Cumulative Contract Totals** (per chain)  
+    - **Unified Contract Growth** across Flow (Cadence + EVM)  
+    - **COA (Cadence Owned Accounts)** vs **EOA (Externally Owned Accounts)** on EVM
+    """
+            )
+    render_contracts_tab()
     render_footer()
 
 with tabs[7]:
@@ -1828,5 +2362,54 @@ with tabs[7]:
     EVM_COLOR     = "#22C55E"  # green
     TOTAL_COLOR   = "#0EA5E9"  # cyan
     NEUTRAL_LINE  = "#64748B"  # slate
-    st.info("Coming next: top deployers, velocity, and retention by cohort.")
+    LINE_COLOR    = "#111827"   # dark gray (for rolling avg / lines)
+    BAR_COLOR     = "#a3a3a3"   # neutral bars
+    def render_contract_deployers_tab():
+        period_key = st.session_state.get("period_key", "last_3_months")
+    
+        # ---- KPI (Cadence)
+        k = qp(render_sql(SQL_DEPLOYERS_CADENCE_KPI, period_key))
+        if k is None or k.empty:
+            st.info("No deployer KPI data.")
+        else:
+            kk = k.copy(); kk.columns = [c.upper() for c in kk.columns]
+            val = pd.to_numeric(kk.iloc[0].get("TOTAL_CADENCE_DEPLOYERS"), errors="coerce")
+            st.metric("Deployers (Cadence)", f"{int(val):,}" if pd.notna(val) else "—")
+    
+        # ---- Timeseries: total new deployers (Cadence+EVM) bars + rolling avg line
+        ts = qp(render_sql(SQL_DEPLOYERS_TIMESERIES, period_key))
+        if ts is not None and not ts.empty:
+            df = ts.copy(); df.columns = [c.upper() for c in df.columns]
+            for c in ("FULL_DEPLOYERS","ROLLING_AVG_FULL_DEPLOYERS"):
+                if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
+            df = df.dropna(subset=["DAY"]).sort_values("DAY")
+    
+            bars = alt.Chart(df).mark_bar(opacity=0.7, color=BAR_COLOR).encode(
+                x=alt.X("DAY:T", title="Period"),
+                y=alt.Y("FULL_DEPLOYERS:Q", title="New deployers"),
+                tooltip=[alt.Tooltip("DAY:T"), alt.Tooltip("FULL_DEPLOYERS:Q", format=",.0f")]
+            )
+            line = alt.Chart(df).mark_line(size=2, color=LINE_COLOR).encode(
+                x="DAY:T",
+                y=alt.Y("ROLLING_AVG_FULL_DEPLOYERS:Q", title="Rolling avg (28-period)"),
+                tooltip=[alt.Tooltip("DAY:T"), alt.Tooltip("ROLLING_AVG_FULL_DEPLOYERS:Q", format=",.2f")]
+            )
+            st.altair_chart((bars + line).properties(height=360, title="Contract (Cadence+EVM) Deployment Over Time — Deployers"), use_container_width=True)
+        else:
+            st.info("No deployer timeseries.")
+    
+        # ---- Methodology
+        with st.expander("Methodology"):
+            st.markdown(
+                """
+    This analysis tracks **unique contract deployers** on both **Flow Cadence** and **Flow EVM**:
+    
+    - **New Deployers** per day (Cadence and EVM separately)  
+    - **Cumulative totals** by chain  
+    - **Total Flow Deployers** (Cadence + EVM) with a rolling average
+    
+    This highlights developer adoption patterns and compares engagement between Cadence and EVM over time.
+    """
+            )
+    render_contract_deployers_tab()
     render_footer()
