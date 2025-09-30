@@ -1719,6 +1719,7 @@ ORDER BY day DESC
 """
 
 -- SQL_WEEKLY_NEW_CONTRACTS_BY_TYPE
+SQL_WEEKLY_NEW_CONTRACTS_BY_TYPE = """
 WITH time_params AS (
   SELECT
     /* Start bound honors your Period control */
@@ -1810,7 +1811,7 @@ SELECT
 FROM cadence_weekly c
 FULL JOIN evm_weekly e ON c.week = e.week
 ORDER BY week ASC;
-
+"""
 
 
 
