@@ -1735,6 +1735,7 @@ with tabs[4]:
     This query provides a comprehensive view of transaction fees on both Flow Cadence and Flow EVM.
     """
             )
+    render_fees_tab()
     render_footer()
 
 with tabs[5]:
@@ -1809,6 +1810,7 @@ with tabs[5]:
     This provides a comprehensive picture of FLOW token liquidity and the impact of staking/locking over time.
     """
             )
+    render_supply_tab()
     render_footer()
 
 with tabs[6]:
