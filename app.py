@@ -2003,7 +2003,6 @@ with tabs[1]:
         c2.info("No data.")
 
     # Timeseries: bars (total) + lines (Cadence/EVM) + rolling avg
-    import altair as alt
     try:
         df = qp(SQL_ACTIVE_ACCOUNTS_TIMESERIES).copy()
         df["day"] = pd.to_datetime(df["DAY"])
@@ -2076,7 +2075,6 @@ with tabs[2]:
         df["TOTAL_NEW_ACCOUNTS"] = pd.to_numeric(df["TOTAL_NEW_ACCOUNTS"])
         df["ROLLING_AVG_NEW_ACCOUNTS"] = pd.to_numeric(df["ROLLING_AVG_NEW_ACCOUNTS"])
 
-        import altair as alt
         bars = alt.Chart(df).mark_bar(color=TOTAL_COLOR).encode(
             x=alt.X("DAY:T", title="Date"),
             y=alt.Y("DAILY_NEW_ACCOUNTS:Q", title="Daily New Accounts"),
@@ -2138,7 +2136,6 @@ with tabs[3]:
         for col in ["ACTIVE_USERS","ROLLING_AVG_ACTIVE_USERS","NEW_ACCOUNTS","ROLLING_AVG_NEW_ACCOUNTS","TOTAL_NEW_ACCOUNTS"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        import altair as alt
         bars_new = alt.Chart(df).mark_bar(color=EVM_COLOR, opacity=0.8).encode(
             x=alt.X("DATE:T", title="Date"),
             y=alt.Y("NEW_ACCOUNTS:Q", title="New / Active / Total Accounts"),
@@ -2388,7 +2385,6 @@ with tabs[6]:
             if weekly_df is None or weekly_df.empty:
                 st.info("No weekly data available for the selected period.")
             else:
-                import altair as alt
                 # long-form for grouped bars
                 weekly_chart = (
                     alt.Chart(weekly_df)
